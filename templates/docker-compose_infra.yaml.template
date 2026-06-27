@@ -1,0 +1,66 @@
+version: "3.8"
+
+services:
+  traefik:
+    image: traefik:v2.10
+    container_name: global_edge_router
+    restart: unless-stopped
+    command:
+      # Provider Configuration
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      
+      # Entrypoints (Ports)
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      
+      # Automatic HTTP to HTTPS Redirection
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      
+      # Automated SSL Certificate Generation (Let's Encrypt)
+      - "--certificatesresolvers.letsencryptresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencryptresolver.acme.email=${LETSENCRYPT_EMAIL}"
+      - "--certificatesresolvers.letsencryptresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Map the system's user-level Podman socket to Traefik's expected Docker socket
+      - "/run/user/${USER_UID}/podman/podman.sock:/var/run/docker.sock:ro"
+      # Persist SSL certificates across container updates
+      - "./letsencrypt:/letsencrypt"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.global-tls.rule=Host(`${APP_DOMAIN}`)"
+      - "traefik.http.routers.global-tls.entrypoints=websecure"
+      - "traefik.http.routers.global-tls.tls.certresolver=letsencryptresolver"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mongo:
+    image: mongo:7.0
+    container_name: shared_production_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    volumes:
+      - mongo_production_data:/data/db
+    networks:
+      - web_gateway
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mongo_production_data:
+
+networks:
+  web_gateway:
+    external: true
