@@ -107,3 +107,8 @@ async def root():
         "port": port,
         "multiplication_factor_set": multiplication_factor_env is not None
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
+

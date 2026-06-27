@@ -102,10 +102,9 @@ The wrapper utility generates a `.env.production` file for each application, pas
   app.listen(port, () => console.log(`Server running on port ${port}`));
   ```
 * **Python Uvicorn (Dockerfile)**:
-  Ensure your `Dockerfile` evaluates the environment variable using shell execution format:
+  Ensure your `Dockerfile` uses the exec-form `ENTRYPOINT` to allow arguments (like `--show-spec`) to be forwarded correctly:
   ```dockerfile
-  ENV PORT=3000
-  CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+  ENTRYPOINT ["python", "main.py"]
   ```
 
 ### Domain Name Retrieval

@@ -25,6 +25,8 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    networks:
+      - web_gateway
     volumes:
       # Map the system's user-level Podman socket to Traefik's expected Docker socket
       - "/run/user/${USER_UID}/podman/podman.sock:/var/run/docker.sock:ro"

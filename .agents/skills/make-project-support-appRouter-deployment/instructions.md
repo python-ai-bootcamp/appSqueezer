@@ -19,6 +19,9 @@ Follow these sequential steps to adapt the target project:
 ### Step 2: Implement the `--show-spec` Contract
 At the absolute beginning of the application's startup file (before database or server initialization), intercept the CLI argument `--show-spec`. If present, print the list of required parameters and secrets, and exit immediately with code `0`.
 
+> [!WARNING]
+> For Python applications, ensure you do not run the server using the `uvicorn` command-line utility in your container entrypoint, as Uvicorn's CLI will intercept `--show-spec` and fail with argument errors. Instead, launch Uvicorn programmatically in code (see Step 4) and run the script using `python`.
+
 #### Node.js Template:
 ```javascript
 if (process.argv.includes('--show-spec')) {
@@ -51,8 +54,12 @@ const path = require('path');
 
 function getSecretOrEnv(secretName, envFallbackName) {
   const secretPath = path.join('/run/secrets', secretName);
-  if (fs.existsSync(secretPath)) {
-    return fs.readFileSync(secretPath, 'utf8').trim();
+  try {
+    if (fs.existsSync(secretPath) && fs.statSync(secretPath).isFile()) {
+      return fs.readFileSync(secretPath, 'utf8').trim();
+    }
+  } catch (err) {
+    // Ignore errors and fall back to environment variables
   }
   return process.env[envFallbackName] || process.env[secretName] || '';
 }
@@ -68,9 +75,13 @@ import os
 
 def get_secret_or_env(secret_name: str, env_fallback_name: str) -> str:
     secret_path = os.path.join('/run/secrets', secret_name)
-    if os.path.exists(secret_path):
-        with open(secret_path, 'r', encoding='utf-8') as f:
-            return f.read().strip()
+    try:
+        if os.path.isfile(secret_path):
+            with open(secret_path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+    except Exception:
+        # Ignore errors and fall back to environment variables
+        pass
     return os.getenv(env_fallback_name) or os.getenv(secret_name) or ''
 
 # Example usage:
@@ -97,10 +108,8 @@ Ensure the server is not listening on a hardcoded port. Update the bootstrap cod
 
 ---
 
-### Step 5: Configure Local Workstation Parity (`.env` & compose)
-1. Generate an `.env` file containing dev environment variables (like mock API keys and database strings).
-2. Append `.env` to the project's `.gitignore` to prevent committing secrets to source control.
-3. Generate a local `docker-compose.dev.yml` file to test the application locally with database container services and the local `.env` variables mapped:
+### Step 5: Create docker-compose.dev.yml
+Generate a local `docker-compose.dev.yml` file to test the application locally with database container services and the local secrets mapped:
    ```yaml
    version: "3.8"
    services:
@@ -110,7 +119,22 @@ Ensure the server is not listening on a hardcoded port. Update the bootstrap cod
          - "3000:3000"
        env_file:
          - .env
-     # local helper database if needed
+       secrets:
+         - source: dev_mongo_uri
+           target: MONGO_URI
+         - source: dev_admin_password
+           target: ADMIN_PASSWORD
+
+     mongo-db:
+       image: mongo:7.0
+       ports:
+         - "27017:27017"
+
+   secrets:
+     dev_mongo_uri:
+       file: ./dev_mongo_uri.txt
+     dev_admin_password:
+       file: ./dev_admin_password.txt
    ```
 
 ---
@@ -119,9 +143,10 @@ Ensure the server is not listening on a hardcoded port. Update the bootstrap cod
 Generate a standardized `Dockerfile` in the root of the project:
 * Ensure it uses lightweight official base images (e.g. `node:20-alpine`, `python:3.11-slim`).
 * Expose port `3000`.
-* Ensure that the execution command (`CMD` or `ENTRYPOINT`) uses shell form or permits passing CLI arguments (so that `podman run --rm <image> --show-spec` behaves correctly).
-  * **Correct Node**: `CMD ["node", "index.js"]`
-  * **Correct Python**: `CMD ["python", "main.py"]`
+* Ensure that the execution command uses **exec form ENTRYPOINT** rather than `CMD` (so that `podman run --rm <image> --show-spec` appends CLI arguments correctly instead of overriding the startup command).
+  * **Correct Node**: `ENTRYPOINT ["node", "index.js"]`
+  * **Correct Python**: `ENTRYPOINT ["python", "main.py"]`
+  * **Note on Package Manager Wrappers**: If you use a package manager wrapper like `ENTRYPOINT ["npm", "start"]`, the orchestrator script is designed to automatically detect this and prepend `--` to forward the argument (i.e. `npm start -- --show-spec`). However, direct process execution (`node`) is preferred for proper OS signal handling and faster shutdowns.
 
 ---
 
@@ -135,6 +160,10 @@ set -e
 APP_NAME="my-app"
 GHCR_USER="your-github-username"
 
+# Make sure you are authenticated to GHCR before running this script:
+# echo $CR_PAT | docker login ghcr.io -u $GHCR_USER --password-stdin
+
+# Note: You can replace 'docker' with 'podman' depending on your local machine configuration.
 echo "Building production image..."
 docker build -t ghcr.io/$GHCR_USER/$APP_NAME:latest .
 

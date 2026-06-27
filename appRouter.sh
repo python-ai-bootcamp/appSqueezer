@@ -122,6 +122,11 @@ if [ "$ACTION" = "create-app" ]; then
                     log_error "Missing value for --app-parameter"
                     show_usage
                 fi
+                PARAM_KEY="${2%%=*}"
+                if [[ "$PARAM_KEY" =~ ^(PORT|NODE_ENV|APP_DOMAIN)$ ]]; then
+                    log_error "Parameter '$PARAM_KEY' is a reserved gateway configuration and cannot be overridden."
+                    exit 1
+                fi
                 APP_PARAMS+=("$2")
                 shift 2
                 ;;
@@ -169,6 +174,11 @@ elif [ "$ACTION" = "configure" ]; then
                 if [ -z "$2" ]; then
                     log_error "Missing value for --app-parameter"
                     show_usage
+                fi
+                PARAM_KEY="${2%%=*}"
+                if [[ "$PARAM_KEY" =~ ^(PORT|NODE_ENV|APP_DOMAIN)$ ]]; then
+                    log_error "Parameter '$PARAM_KEY' is a reserved gateway configuration and cannot be overridden."
+                    exit 1
                 fi
                 APP_PARAMS+=("$2")
                 shift 2
@@ -426,7 +436,7 @@ do_install() {
 
     # Handle auto-password generation if not provided
     if [ -z "$MONGO_ROOT_PASSWORD" ]; then
-        MONGO_ROOT_PASSWORD=$(openssl rand -hex 16 2>/dev/null || gpg --gen-random --armor 1 16 2>/dev/null || echo "SecurePass$(date +%s)")
+        MONGO_ROOT_PASSWORD=$(openssl rand -hex 16 2>/dev/null || gpg --gen-random --armor 1 16 2>/dev/null || dd if=/dev/urandom bs=1 count=16 2>/dev/null | od -An -vtx1 | tr -d ' \n' || echo "SecurePass$(date +%s%N)")
         log_info "Auto-generated secure MongoDB root password."
     fi
 
@@ -439,7 +449,7 @@ do_install() {
 
     log_info "1. Installing OS dependencies..."
     sudo apt update
-    sudo apt install -y git podman podman-compose gnupg pass
+    sudo apt install -y git podman podman-compose gnupg pass jq
 
     log_info "2. Enabling and starting Podman user socket and restart service..."
     # Enable lingering to allow user services to run when not logged in
@@ -557,6 +567,7 @@ do_create_app() {
     # Extract base image name
     IMAGE_BASE="${IMAGE##*/}"
     APP_NAME="${IMAGE_BASE%%:*}"
+    APP_NAME=$(echo "$APP_NAME" | tr '.' '-')
     # Ensure database name uses underscores instead of hyphens/periods
     DB_NAME=$(echo "$APP_NAME" | tr '-' '_' | tr '.' '_')_db
     
@@ -571,9 +582,9 @@ do_create_app() {
     
     # Extract root mongo credentials and APP_DOMAIN
     set +e
-    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2)
-    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2)
-    APP_DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_FILE" | cut -d= -f2)
+    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
+    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
+    APP_DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
     set -e
     
     if [ -z "$MONGO_ROOT_USER" ] || [ -z "$MONGO_ROOT_PASSWORD" ]; then
@@ -590,15 +601,29 @@ do_create_app() {
     podman pull "$IMAGE" >/dev/null
 
     log_info "2. Inspecting application contract via --show-spec..."
-    SPEC_OUTPUT=$(podman run --rm "$IMAGE" --show-spec 2>/dev/null || true)
+    ENTRYPOINT_JSON=$(podman image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}' 2>/dev/null || echo "null")
+    IS_WRAPPER=$(echo "$ENTRYPOINT_JSON" | jq -e 'type == "array" and (.[0] | sub(".*/"; "") | in({"npm":1, "yarn":1, "pnpm":1, "bun":1}))' >/dev/null 2>&1 && echo "true" || echo "false")
+    SPEC_ERR_FILE=$(mktemp)
+    if [ "$IS_WRAPPER" = "true" ]; then
+        log_info "Package manager entrypoint wrapper detected. Injecting '--' before contract flags."
+        SPEC_OUTPUT=$(podman run --rm "$IMAGE" -- --show-spec 2>"$SPEC_ERR_FILE" || true)
+    else
+        SPEC_OUTPUT=$(podman run --rm "$IMAGE" --show-spec 2>"$SPEC_ERR_FILE" || true)
+    fi
     
     if ! echo "$SPEC_OUTPUT" | grep -q "^REQUIRED_PARAMETERS="; then
         log_error "Application contract validation failed: Image does not support --show-spec or is invalid."
+        if [ -s "$SPEC_ERR_FILE" ]; then
+            log_error "Container error output:"
+            cat "$SPEC_ERR_FILE" >&2
+        fi
+        rm -f "$SPEC_ERR_FILE"
         exit 1
     fi
+    rm -f "$SPEC_ERR_FILE"
 
-    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2 | tr -d '\r')
-    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2 | tr -d '\r')
+    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
+    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
 
     # Validate required parameters
     IFS=',' read -ra REQ_PARAMS <<< "$REQ_PARAMS_STR"
@@ -666,7 +691,7 @@ do_create_app() {
 
     # Generate unique scoped DB credentials
     APP_DB_USER="user_$(echo "$APP_NAME" | tr '-' '_' | tr '.' '_')"
-    APP_DB_PASSWORD=$(openssl rand -hex 16 2>/dev/null || gpg --gen-random --armor 1 16 2>/dev/null || echo "AppPass$(date +%s)")
+    APP_DB_PASSWORD=$(openssl rand -hex 16 2>/dev/null || gpg --gen-random --armor 1 16 2>/dev/null || dd if=/dev/urandom bs=1 count=16 2>/dev/null | od -An -vtx1 | tr -d ' \n' || echo "AppPass$(date +%s%N)")
     SCOPED_MONGO_URI="mongodb://${APP_DB_USER}:${APP_DB_PASSWORD}@shared_production_mongodb:27017/${DB_NAME}?authSource=admin"
 
     # Create user in MongoDB
@@ -829,7 +854,7 @@ do_list() {
             ENV_PATH="$dir/.env.production"
             DOMAIN="unknown-domain"
             if [ -f "$ENV_PATH" ]; then
-                DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_PATH" | cut -d= -f2)
+                DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_PATH" | cut -d= -f2 | tr -d '\r')
             fi
             
             ROUTE_URL="https://${DOMAIN}/${APP_DIR_NAME}"
@@ -847,7 +872,7 @@ do_list() {
 }
 
 do_start() {
-    APP_NAME="$1"
+    APP_NAME=$(echo "$1" | tr '.' '-')
     APP_DIR="/opt/$APP_NAME"
     if [ ! -d "$APP_DIR" ] || [ ! -f "$APP_DIR/docker-compose.prod.yml" ]; then
         log_error "Application '$APP_NAME' is not deployed or missing docker-compose.prod.yml."
@@ -860,7 +885,7 @@ do_start() {
 }
 
 do_stop() {
-    APP_NAME="$1"
+    APP_NAME=$(echo "$1" | tr '.' '-')
     APP_DIR="/opt/$APP_NAME"
     if [ ! -d "$APP_DIR" ] || [ ! -f "$APP_DIR/docker-compose.prod.yml" ]; then
         log_error "Application '$APP_NAME' is not deployed or missing docker-compose.prod.yml."
@@ -873,7 +898,7 @@ do_stop() {
 }
 
 do_restart() {
-    APP_NAME="$1"
+    APP_NAME=$(echo "$1" | tr '.' '-')
     APP_DIR="/opt/$APP_NAME"
     if [ ! -d "$APP_DIR" ] || [ ! -f "$APP_DIR/docker-compose.prod.yml" ]; then
         log_error "Application '$APP_NAME' is not deployed or missing docker-compose.prod.yml."
@@ -886,7 +911,7 @@ do_restart() {
 }
 
 do_logs() {
-    APP_NAME="$1"
+    APP_NAME=$(echo "$1" | tr '.' '-')
     shift
     APP_DIR="/opt/$APP_NAME"
     if [ ! -d "$APP_DIR" ] || [ ! -f "$APP_DIR/docker-compose.prod.yml" ]; then
@@ -898,7 +923,7 @@ do_logs() {
 }
 
 do_configure() {
-    APP_NAME="$1"
+    APP_NAME=$(echo "$1" | tr '.' '-')
     APP_DIR="/opt/$APP_NAME"
     ENV_FILE="$INFRA_DIR/.env"
     
@@ -913,7 +938,7 @@ do_configure() {
         exit 1
     fi
     set +e
-    APP_DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_FILE" | cut -d= -f2)
+    APP_DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
     set -e
     if [ -z "$APP_DOMAIN" ]; then
         log_error "Failed to retrieve APP_DOMAIN from $ENV_FILE."
@@ -933,13 +958,14 @@ do_configure() {
 
     if [ "$CLEAR_PARAMS" = false ] && [ -f "$APP_DIR/.env.production" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
-            [[ "$line" =~ ^# ]] && continue
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^(PORT|NODE_ENV|APP_DOMAIN)= ]] && continue
+            line=$(echo "$line" | tr -d '\r')
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            if [[ "$line" != *=* ]]; then continue; fi
             
             KEY="${line%%=*}"
             VAL="${line#*=}"
-            if [ "$KEY" != "APP_CPUS" ] && [ "$KEY" != "APP_MEM_LIMIT" ]; then
+            if [ "$KEY" != "PORT" ] && [ "$KEY" != "NODE_ENV" ] && [ "$KEY" != "APP_DOMAIN" ] && [ "$KEY" != "APP_CPUS" ] && [ "$KEY" != "APP_MEM_LIMIT" ]; then
                 MERGED_PARAMS["$KEY"]="$VAL"
             fi
         done < "$APP_DIR/.env.production"
@@ -970,7 +996,7 @@ do_configure() {
     # Merge/Clear Secrets
     declare -A MAPPED_SECRETS
     if [ "$CLEAR_SECRETS" = false ] && [ -f "$APP_DIR/docker-compose.prod.yml" ]; then
-        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9_]*" "$APP_DIR/docker-compose.prod.yml" | sort -u); do
+        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9_]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
             KEY="${s_source#${APP_NAME}_secret_}"
             MAPPED_SECRETS["$KEY"]="$s_source"
         done
@@ -996,15 +1022,29 @@ do_configure() {
 
     # Pre-Flight Contract Verification
     log_info "Inspecting application contract via --show-spec..."
-    SPEC_OUTPUT=$(podman run --rm "$IMAGE" --show-spec 2>/dev/null || true)
+    ENTRYPOINT_JSON=$(podman image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}' 2>/dev/null || echo "null")
+    IS_WRAPPER=$(echo "$ENTRYPOINT_JSON" | jq -e 'type == "array" and (.[0] | sub(".*/"; "") | in({"npm":1, "yarn":1, "pnpm":1, "bun":1}))' >/dev/null 2>&1 && echo "true" || echo "false")
+    SPEC_ERR_FILE=$(mktemp)
+    if [ "$IS_WRAPPER" = "true" ]; then
+        log_info "Package manager entrypoint wrapper detected. Injecting '--' before contract flags."
+        SPEC_OUTPUT=$(podman run --rm "$IMAGE" -- --show-spec 2>"$SPEC_ERR_FILE" || true)
+    else
+        SPEC_OUTPUT=$(podman run --rm "$IMAGE" --show-spec 2>"$SPEC_ERR_FILE" || true)
+    fi
     
     if ! echo "$SPEC_OUTPUT" | grep -q "^REQUIRED_PARAMETERS="; then
         log_error "Application contract validation failed: Image does not support --show-spec or is invalid."
+        if [ -s "$SPEC_ERR_FILE" ]; then
+            log_error "Container error output:"
+            cat "$SPEC_ERR_FILE" >&2
+        fi
+        rm -f "$SPEC_ERR_FILE"
         exit 1
     fi
+    rm -f "$SPEC_ERR_FILE"
 
-    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2 | tr -d '\r')
-    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2 | tr -d '\r')
+    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
+    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
 
     # Validate parameters
     IFS=',' read -ra REQ_PARAMS <<< "$REQ_PARAMS_STR"
@@ -1134,7 +1174,7 @@ EOF
 }
 
 do_update() {
-    APP_NAME="$1"
+    APP_NAME=$(echo "$1" | tr '.' '-')
     NEW_IMAGE="$2"
     APP_DIR="/opt/$APP_NAME"
     ENV_FILE="$INFRA_DIR/.env"
@@ -1161,13 +1201,14 @@ do_update() {
 
     if [ -f "$APP_DIR/.env.production" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
-            [[ "$line" =~ ^# ]] && continue
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^(PORT|NODE_ENV|APP_DOMAIN)= ]] && continue
+            line=$(echo "$line" | tr -d '\r')
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            if [[ "$line" != *=* ]]; then continue; fi
             
             KEY="${line%%=*}"
             VAL="${line#*=}"
-            if [ "$KEY" != "APP_CPUS" ] && [ "$KEY" != "APP_MEM_LIMIT" ]; then
+            if [ "$KEY" != "PORT" ] && [ "$KEY" != "NODE_ENV" ] && [ "$KEY" != "APP_DOMAIN" ] && [ "$KEY" != "APP_CPUS" ] && [ "$KEY" != "APP_MEM_LIMIT" ]; then
                 MERGED_PARAMS["$KEY"]="$VAL"
             fi
         done < "$APP_DIR/.env.production"
@@ -1182,22 +1223,36 @@ do_update() {
     
     declare -A MAPPED_SECRETS
     if [ -f "$APP_DIR/docker-compose.prod.yml" ]; then
-        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9_]*" "$APP_DIR/docker-compose.prod.yml" | sort -u); do
+        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9_]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
             KEY="${s_source#${APP_NAME}_secret_}"
             MAPPED_SECRETS["$KEY"]="$s_source"
         done
     fi
     
     log_info "2. Inspecting contract of new image via --show-spec..."
-    SPEC_OUTPUT=$(podman run --rm "$IMAGE" --show-spec 2>/dev/null || true)
+    ENTRYPOINT_JSON=$(podman image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}' 2>/dev/null || echo "null")
+    IS_WRAPPER=$(echo "$ENTRYPOINT_JSON" | jq -e 'type == "array" and (.[0] | sub(".*/"; "") | in({"npm":1, "yarn":1, "pnpm":1, "bun":1}))' >/dev/null 2>&1 && echo "true" || echo "false")
+    SPEC_ERR_FILE=$(mktemp)
+    if [ "$IS_WRAPPER" = "true" ]; then
+        log_info "Package manager entrypoint wrapper detected. Injecting '--' before contract flags."
+        SPEC_OUTPUT=$(podman run --rm "$IMAGE" -- --show-spec 2>"$SPEC_ERR_FILE" || true)
+    else
+        SPEC_OUTPUT=$(podman run --rm "$IMAGE" --show-spec 2>"$SPEC_ERR_FILE" || true)
+    fi
     
     if ! echo "$SPEC_OUTPUT" | grep -q "^REQUIRED_PARAMETERS="; then
         log_error "Application contract validation failed: Updated image does not support --show-spec or is invalid."
+        if [ -s "$SPEC_ERR_FILE" ]; then
+            log_error "Container error output:"
+            cat "$SPEC_ERR_FILE" >&2
+        fi
+        rm -f "$SPEC_ERR_FILE"
         exit 1
     fi
+    rm -f "$SPEC_ERR_FILE"
 
-    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2 | tr -d '\r')
-    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2 | tr -d '\r')
+    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
+    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
 
     # Validate parameters
     IFS=',' read -ra REQ_PARAMS <<< "$REQ_PARAMS_STR"
@@ -1308,7 +1363,7 @@ EOF
 }
 
 do_destroy_app() {
-    APP_NAME="$1"
+    APP_NAME=$(echo "$1" | tr '.' '-')
     APP_DIR="/opt/$APP_NAME"
     ENV_FILE="$INFRA_DIR/.env"
     
@@ -1338,8 +1393,8 @@ do_destroy_app() {
         log_info "3. Dropping database and user from MongoDB..."
         if [ -f "$ENV_FILE" ]; then
             set +e
-            MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2)
-            MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2)
+            MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
+            MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
             set -e
             
             if [ -n "$MONGO_ROOT_USER" ] && [ -n "$MONGO_ROOT_PASSWORD" ]; then
@@ -1351,8 +1406,8 @@ do_destroy_app() {
                     -p "$MONGO_ROOT_PASSWORD" \
                     --authenticationDatabase admin \
                     --eval "
+                        db.getSiblingDB('${DB_NAME}').dropUser('${APP_DB_USER}');
                         db.getSiblingDB('${DB_NAME}').dropDatabase();
-                        db.getSiblingDB('admin').dropUser('${APP_DB_USER}');
                     " >/dev/null
                 log_success "Database '${DB_NAME}' and user '${APP_DB_USER}' dropped."
             else
@@ -1395,14 +1450,17 @@ do_destroy_app() {
 }
 
 do_backup() {
+    APP_NAME=$(echo "$APP_NAME" | tr '.' '-')
+    # Sanitize backup description to prevent path traversal and invalid filename characters
+    BACKUP_DESC=$(printf "%s" "$BACKUP_DESC" | tr -c 'a-zA-Z0-9_-' '_')
     ENV_FILE="$INFRA_DIR/.env"
     if [ ! -f "$ENV_FILE" ]; then
         log_error "Central infrastructure is not installed or .env is missing. Run install first."
         exit 1
     fi
     set +e
-    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2)
-    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2)
+    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
+    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
     set -e
     if [ -z "$MONGO_ROOT_USER" ] || [ -z "$MONGO_ROOT_PASSWORD" ]; then
         log_error "Failed to retrieve MongoDB root credentials from $ENV_FILE."
@@ -1459,7 +1517,8 @@ do_backup() {
             --authenticationDatabase=admin \
             --db="$DB_NAME" \
             --archive \
-            --gzip > "$BACKUP_FILE" 2>/dev/null
+            --gzip \
+            --quiet > "$BACKUP_FILE"
         STATUS=$?
         set -e
 
@@ -1473,14 +1532,15 @@ do_backup() {
 }
 
 do_restore() {
+    APP_NAME=$(echo "$APP_NAME" | tr '.' '-')
     ENV_FILE="$INFRA_DIR/.env"
     if [ ! -f "$ENV_FILE" ]; then
         log_error "Central infrastructure is not installed or .env is missing. Run install first."
         exit 1
     fi
     set +e
-    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2)
-    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2)
+    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
+    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
     set -e
     if [ -z "$MONGO_ROOT_USER" ] || [ -z "$MONGO_ROOT_PASSWORD" ]; then
         log_error "Failed to retrieve MongoDB root credentials from $ENV_FILE."
@@ -1526,6 +1586,13 @@ do_restore() {
         fi
         
         # Verify the specified backup exists
+        # Sanitize backup name to prevent path traversal
+        SAFE_BACKUP_NAME=$(basename "$BACKUP_NAME")
+        if [ "$SAFE_BACKUP_NAME" != "$BACKUP_NAME" ]; then
+            log_error "Backup name contains invalid path characters."
+            exit 1
+        fi
+        
         BACKUP_FILE="/opt/$APP_NAME/backups/$BACKUP_NAME"
         if [ ! -f "$BACKUP_FILE" ]; then
             log_error "Backup file '$BACKUP_NAME' not found under /opt/$APP_NAME/backups/."
@@ -1555,7 +1622,8 @@ do_restore() {
             --authenticationDatabase=admin \
             --drop \
             --archive \
-            --gzip < "$backup_file" 2>/dev/null
+            --gzip \
+            --quiet < "$backup_file"
         STATUS=$?
         set -e
 

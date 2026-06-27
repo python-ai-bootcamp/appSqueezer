@@ -20,5 +20,5 @@ ENV NODE_ENV=production
 # Expose port dynamically (informational only)
 EXPOSE 3000
 
-# Start app using shell format to evaluate environment variables
-CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+# Start app
+ENTRYPOINT ["python", "main.py"]
