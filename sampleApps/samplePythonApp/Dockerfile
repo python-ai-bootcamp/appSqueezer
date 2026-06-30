@@ -15,7 +15,8 @@ COPY main.py ./
 
 # Define environment variables with defaults
 ENV PORT=3000
-ENV NODE_ENV=production
+ENV APP_ENV=production
+ENV PYTHONUNBUFFERED=1
 
 # Expose port dynamically (informational only)
 EXPOSE 3000

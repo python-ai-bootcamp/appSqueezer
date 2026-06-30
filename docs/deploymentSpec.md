@@ -30,6 +30,7 @@ To set up this architecture from scratch on a vanilla VM, the following dependen
 | `podman` | Secure, daemonless, rootless container engine. |
 | `podman-compose` | Compose tool for Podman container orchestration. |
 | `gnupg` & `pass` | Safe and secure credential helpers for managing private registry authentication. |
+| `jq` | Command-line JSON processor used to inspect container configuration contracts. |
 
 ---
 
@@ -72,6 +73,7 @@ When invoked with `uninstall`, the script performs teardown in reverse order:
 1. **Rootless Operation**: All container workloads run under the non-root deployment user. If Traefik is compromised, the attacker only obtains access to the unprivileged user namespace.
 2. **Port Isolation**: The shared MongoDB instance is not exposed to the host VM ports (no port mapping is defined in the compose config). Communication is strictly restricted inside the virtual `web_gateway` network.
 3. **Strict SSL Storage Permissions**: Traefik requires `acme.json` to have exactly `600` (read/write only by owner) permissions to prevent SSL private keys leak.
+4. **Unprivileged Port Configuration**: By default, rootless users on Linux cannot bind to ports below 1024. The installer automatically configures `net.ipv4.ip_unprivileged_port_start=80` (persisted in `/etc/sysctl.d/99-podman-ports.conf`) to allow Traefik to bind to standard HTTP (80) and HTTPS (443) ports without root privileges.
 
 ---
 
@@ -98,7 +100,7 @@ The installer accepts CLI parameters (or falls back to defaults) and writes them
 ### B. Simplified Downstream Routing
 Because Traefik binds the central `APP_DOMAIN` globally to handle certificate resolution:
 1. Downstream applications (Phase 2) do not need to repeat the domain name or configure an ACME certresolver.
-2. Downstream compose files only require routing by path prefixes (e.g. `PathPrefix(\`/node-api\`)) and enabling TLS (`tls=true`).
+2. Downstream compose files only require routing by path prefixes (e.g., `PathPrefix(\`/node-api\`)) and enabling TLS (`tls=true`).
 
 ---
 
@@ -107,7 +109,7 @@ Because Traefik binds the central `APP_DOMAIN` globally to handle certificate re
 To simplify adding new applications to the VM setup, the `create-app` command automates application deployment.
 
 ```sh
-./appRouter.sh create-app <container-image-url> [--app-parameter "KEY=VALUE"]... [--app-secret "KEY=VALUE"]... [--cpu <limit>] [--memory <limit>]
+./appRouter.sh create-app <container-image-url> [--app-parameter "KEY=VALUE"]... [--app-secret "KEY=VALUE"]... [--cpu <limit>] [--memory <limit>] [--use-existing-parameters | --disregard-existing-parameters] [--use-existing-secrets | --disregard-existing-secrets] [--use-existing-data | --disregard-existing-data]
 ```
 
 ### Options:
@@ -115,24 +117,28 @@ To simplify adding new applications to the VM setup, the `create-app` command au
 * `--app-secret`: Repeatable flag to register and mount application-specific sensitive configurations (like passwords, keys) via Podman Secrets (e.g., `--app-secret "ADMIN_PASSWORD=secret"`).
 * `--cpu`: Optional allocation limit for CPU cores (e.g., `--cpu "0.5"` limits container process to 50% of one core).
 * `--memory`: Optional allocation limit for RAM (e.g., `--memory "512M"` limits container to 512MB RAM). Defaults to no limit.
+* `--use-existing-parameters` / `--disregard-existing-parameters`: Choices for managing existing parameters inside `/opt/<app-name>` if leftovers are found.
+* `--use-existing-secrets` / `--disregard-existing-secrets`: Choices for managing existing registered secrets in Podman if leftovers are found.
+* `--use-existing-data` / `--disregard-existing-data`: Choices for managing existing databases and users in MongoDB if leftovers are found.
 
 ### Automation Flow:
-1. **Identifier Extraction**: The command parses the container image name from the URL (e.g., `registry.gitlab.com/username/my-service:latest` yields `my-service`).
-2. **Pre-flight Contract Verification**:
+1. **Leftovers Verification**: Scans the host for existing parameters (configuration files in `/opt/<app-name>`), secrets (in Podman), and data (users/databases in MongoDB). If any leftovers are detected and the corresponding flag is omitted, the command terminates with an error instructing the user to specify their reuse or disregard preference.
+2. **Identifier Extraction**: The command parses the container image name from the URL (e.g., `registry.gitlab.com/username/my-service:latest` yields `my-service`).
+3. **Pre-flight Contract Verification**:
    * Pulls the image and executes a mock container instance querying its contract: `podman run --rm <image> --show-spec`.
-   * Enforces that the output defines `REQUIRED_PARAMETERS=` and `REQUIRED_SECRETS=`.
-   * Verifies that all declared required fields are present in the provided CLI options. **Halts execution immediately** if any requirement is missing.
-3. **Directory Isolation**: Sets up a dedicated deployment directory at `/opt/my-service` owned by the current non-root operator.
-4. **Database Credentials Isolation**: 
-   * Auto-generates a unique username (`user_my_service`) and password.
+   * Enforces that the output defines both a `REQUIRED_PARAMETERS=` line and a `REQUIRED_SECRETS=` line. Both lines must be present, but either may have an empty value (e.g. `REQUIRED_SECRETS=`) if the application has no requirements in that category.
+   * Verifies that all declared required fields are present in the provided or existing configurations. **Halts execution immediately** if any requirement is missing.
+4. **Directory Isolation**: Sets up a dedicated deployment directory at `/opt/my-service` owned by the current non-root operator (or reuses/cleans the directory based on parameter flags).
+5. **Database Credentials Isolation**: 
+   * If secrets are reused, retrieves the existing password from the secret store. Otherwise, auto-generates a unique username (`user_my_service`) and password.
    * Connects to the running `shared_production_mongodb` database container via `podman exec`.
-   * Provisions this new user with scoped `readWrite` permissions exclusively on `my_service_db` (ensuring no database root password leaks and full app-to-app data separation).
-5. **Secrets-Based Injection**: 
+   * Provisions this user (or updates their password) with scoped `readWrite` permissions exclusively on `my_service_db` (ensuring no database root password leaks and full app-to-app data separation).
+6. **Secrets-Based Injection**: 
    * Stores the scoped database connection URI as a Podman Secret (`my-service_mongo_uri`).
    * Stores each app-specific secret as a Podman Secret (`my-service_secret_<KEY>`).
    * Mounts all secrets inside the container under `/run/secrets/` (available only in the container's volatile memory filesystem, preventing plaintext passwords from sitting on the host disk).
-6. **Path Routing Configuration**: Generates the application's `/opt/my-service/docker-compose.prod.yml` (mapping the secrets) and `/opt/my-service/.env.production` (injecting `PORT=3000`, `NODE_ENV=production`, `APP_DOMAIN`, and any custom `--app-parameter` flags).
-7. **Deployment**: Triggers container initialization dynamically. The service immediately becomes live under `https://<APP_DOMAIN>/my-service`.
+7. **Path Routing Configuration**: Generates the application's `/opt/my-service/docker-compose.prod.yml` (mapping the secrets) and `/opt/my-service/.env.production` (injecting `PORT=3000`, `APP_ENV=production`, `APP_DOMAIN`, and any custom `--app-parameter` flags).
+8. **Deployment**: Triggers container initialization dynamically. The service immediately becomes live under `https://<APP_DOMAIN>/my-service`.
 
 ---
 
@@ -148,7 +154,7 @@ Manage container states without altering configurations:
   ```
 * **`start <app-name>`**: Boots the application container using `podman-compose up -d`.
 * **`stop <app-name>`**: Shuts down the container gracefully using `podman-compose down`.
-* **`restart <app-name>`**: Triggers container process restart using `podman-compose restart`.
+* **`restart <app-name>`**: Stops and recreates the container using `podman-compose down && podman-compose up -d` to ensure any configuration, secret, or environment updates are applied.
 * **`logs <app-name> [options]`**: Proxies logs directly from the container. Supports passing standard options (e.g. `./appRouter.sh logs my-app -f --tail 100`).
 
 ### B. Configuration Updates (`configure`)
@@ -157,7 +163,11 @@ Allows updating parameters and secrets for already deployed applications. It par
 ./appRouter.sh configure <app-name> [--app-parameter "K=V"]... [--app-secret "K=V"]... [--cpu <val>] [--memory <val>] [--clear-app-parameters] [--clear-app-secrets] [--clear-app-limits]
 ```
 * **Merge Logic**: Overwrites specified keys/limits while retaining existing configurations inside `.env.production` and `docker-compose.prod.yml`.
+  > [!IMPORTANT]
+  > The `configure` command only updates configuration files on the host disk and secret stores. It **does not auto-restart** the running application container. The operator must run `./appRouter.sh restart <app-name>` explicitly to apply configuration updates.
 * **Bypass Secret Input**: Evaluates contract checks against already registered secrets, eliminating the need to re-type existing database passwords or third-party keys.
+  > [!NOTE]
+  > Unlike `create-app` or `update`, the `configure` subcommand does not pull container image layers from remote registries. It performs contract verification strictly against the already cached local image of the application.
 * **`--clear-app-parameters`**: Clears all previous configurations from `.env.production` before writing new parameters.
 * **`--clear-app-secrets`**: Removes all app-specific `secret_*` registrations in Podman and mounts only the newly supplied secrets.
 * **`--clear-app-limits`**: Discards existing CPU and Memory allocation constraints on the container.
@@ -198,7 +208,7 @@ Generates compressed MongoDB database dumps:
 ./appRouter.sh backup --all [--description=<suffix>]
 ```
 * **Storage Location**: Saved locally under `/opt/<app-name>/backups/` owned by the unprivileged operator.
-* **Naming Convention**: Filenames are formatted as: `YYYY_MM_DD__hh_mm_ss__<description>.gzip` (e.g. `2026_06_27__21_46_26__pre_upgrade.gzip`).
+* **Naming Convention**: Filenames are formatted as: `YYYY_MM_DD__hh_mm_ss__<description>.gzip` (e.g. `2026_06_27__21_46_26__pre_upgrade.gzip`). The `--description` value only accepts alphanumeric characters, hyphens, and underscores.
 * **Underlying Command**: Streams data from the container:
   `podman exec -i shared_production_mongodb mongodump --archive --gzip --db=<db-name> ...`
 
@@ -215,4 +225,7 @@ Restores a database from a compressed dump, dropping existing collections first 
   1. Gracefully stops the target application container(s) to avoid write conflicts.
   2. Executes `mongorestore --drop --archive --gzip` inside MongoDB, purging previous collections and importing the backup file stream.
   3. Re-starts the application container(s).
+
+  > [!NOTE]
+  > The backup archive stores data under the original database namespace at the time of backup. If an application has been renamed after a backup was taken, restoring will import data under the **original** database name, not the current one. Always ensure the application name matches the backup's source application.
 

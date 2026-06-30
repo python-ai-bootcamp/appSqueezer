@@ -3,6 +3,9 @@
 # Exit immediately if a command exits with a non-zero status
 set -e
 
+# Ensure standard user runtime directory is exported for systemd user services
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
 # Configuration / Output paths
 INFRA_DIR="/opt/web-infrastructure"
 TEMPLATE_FILE="$(dirname "$0")/templates/docker-compose_infra.yaml.template"
@@ -30,6 +33,107 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+verify_mongodb_ready() {
+    if ! podman ps --format "{{.Names}}" | grep -q "^shared_production_mongodb$"; then
+        log_error "MongoDB container 'shared_production_mongodb' is not running. Start infrastructure first."
+        exit 1
+    fi
+    local max_attempts=30
+    local attempt=1
+    log_info "Verifying MongoDB connectivity..."
+    while [ $attempt -le $max_attempts ]; do
+        set +e
+        podman exec -i shared_production_mongodb mongosh \
+            -u "$MONGO_ROOT_USER" \
+            -p "$MONGO_ROOT_PASSWORD" \
+            --authenticationDatabase admin \
+            --eval "db.adminCommand('ping')" >/dev/null 2>&1
+        STATUS=$?
+        set -e
+        if [ $STATUS -eq 0 ]; then
+            log_success "MongoDB is ready."
+            return 0
+        fi
+        log_info "MongoDB is not ready yet (attempt $attempt/$max_attempts), retrying in 2 seconds..."
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+    log_error "Timeout: MongoDB did not become ready to accept connections."
+    exit 1
+}
+
+verify_container_contract() {
+    local image="$1"
+    local error_msg_prefix="$2"
+    
+    log_info "Inspecting application contract via --show-spec..." >&2
+    
+    local entrypoint_json
+    local cmd_json
+    entrypoint_json=$(podman image inspect "$image" --format '{{json .Config.Entrypoint}}' 2>/dev/null || echo "null")
+    cmd_json=$(podman image inspect "$image" --format '{{json .Config.Cmd}}' 2>/dev/null || echo "null")
+    
+    local is_wrapper="false"
+    local spec_err_file
+    spec_err_file=$(mktemp)
+    local spec_output=""
+    
+    if [ "$entrypoint_json" = "null" ] || [ "$entrypoint_json" = "[]" ]; then
+        if [ "$cmd_json" != "null" ] && [ "$cmd_json" != "[]" ]; then
+            is_wrapper=$(echo "$cmd_json" | jq -e 'type == "array" and (.[0] | strings | sub(".*/"; "") | in({"npm":1, "yarn":1, "pnpm":1, "bun":1}))' >/dev/null 2>&1 && echo "true" || echo "false")
+            
+            local cmd_args=()
+            while IFS= read -r arg; do
+                cmd_args+=("$arg")
+            done < <(echo "$cmd_json" | jq -r '.[]')
+            
+            if [ "$is_wrapper" = "true" ]; then
+                log_info "Package manager command wrapper detected in CMD. Overriding Entrypoint and injecting '--'." >&2
+                spec_output=$(timeout 10 podman run --rm --entrypoint "" "$image" "${cmd_args[@]}" -- --show-spec 2>"$spec_err_file" || true)
+            else
+                log_info "Using CMD elements as args. Overriding Entrypoint." >&2
+                spec_output=$(timeout 10 podman run --rm --entrypoint "" "$image" "${cmd_args[@]}" --show-spec 2>"$spec_err_file" || true)
+            fi
+        else
+            spec_output=$(timeout 10 podman run --rm "$image" --show-spec 2>"$spec_err_file" || true)
+        fi
+    else
+        is_wrapper=$(echo "$entrypoint_json" | jq -e 'type == "array" and (.[0] | strings | sub(".*/"; "") | in({"npm":1, "yarn":1, "pnpm":1, "bun":1}))' >/dev/null 2>&1 && echo "true" || echo "false")
+        
+        local entry_args=()
+        while IFS= read -r arg; do
+            entry_args+=("$arg")
+        done < <(echo "$entrypoint_json" | jq -r '.[]')
+        
+        local cmd_args=()
+        if [ "$cmd_json" != "null" ] && [ "$cmd_json" != "[]" ]; then
+            while IFS= read -r arg; do
+                cmd_args+=("$arg")
+            done < <(echo "$cmd_json" | jq -r '.[]')
+        fi
+        
+        if [ "$is_wrapper" = "true" ]; then
+            log_info "Package manager entrypoint wrapper detected. Overriding Entrypoint and injecting '--'." >&2
+            spec_output=$(timeout 10 podman run --rm --entrypoint "" "$image" "${entry_args[@]}" "${cmd_args[@]}" -- --show-spec 2>"$spec_err_file" || true)
+        else
+            log_info "Combining Entrypoint and CMD. Overriding Entrypoint." >&2
+            spec_output=$(timeout 10 podman run --rm --entrypoint "" "$image" "${entry_args[@]}" "${cmd_args[@]}" --show-spec 2>"$spec_err_file" || true)
+        fi
+    fi
+    
+    if ! echo "$spec_output" | grep -q "^REQUIRED_PARAMETERS=" || ! echo "$spec_output" | grep -q "^REQUIRED_SECRETS="; then
+        log_error "$error_msg_prefix" >&2
+        if [ -s "$spec_err_file" ]; then
+            log_error "Container error output:" >&2
+            cat "$spec_err_file" >&2
+        fi
+        rm -f "$spec_err_file"
+        exit 1
+    fi
+    rm -f "$spec_err_file"
+    echo "$spec_output"
+}
+
 # Ensure script is NOT run directly as root to preserve user-level Podman environment
 if [ "$EUID" -eq 0 ]; then
     log_error "Please do not run this script as root/sudo directly."
@@ -38,40 +142,170 @@ if [ "$EUID" -eq 0 ]; then
 fi
 
 show_usage() {
-    echo "Usage:"
-    echo "  $0 install -d <domain> [-e <email>] [-u <mongo-user>] [-p <mongo-password>]"
-    echo "  $0 uninstall [-y|--non-interactive]"
-    echo "  $0 create-app <image> [--app-parameter \"KEY=VALUE\"]... [--app-secret \"KEY=VALUE\"]... [--cpu <limit>] [--memory <limit>]"
-    echo "  $0 list"
-    echo "  $0 start <app-name>"
-    echo "  $0 stop <app-name>"
-    echo "  $0 restart <app-name>"
-    echo "  $0 logs <app-name> [compose-options...]"
-    echo "  $0 configure <app-name> [--app-parameter \"KEY=VALUE\"]... [--app-secret \"KEY=VALUE\"]... [--cpu <limit>] [--memory <limit>] [--clear-app-parameters] [--clear-app-secrets] [--clear-app-limits]"
-    echo "  $0 update <app-name> [--image <new-image-url>]"
-    echo "  $0 destroy-app <app-name> [--keep-secrets | --delete-secrets] [--keep-parameters | --delete-parameters] [--keep-data | --delete-data] [--keep-backups | --delete-backups]"
-    echo "  $0 backup [--app-name=<name> | --all] [--description=<suffix>]"
-    echo "  $0 restore [--app-name=<name> --backup-name=<file> | --all]"
+    local exit_code="${1:-1}"
+    echo "Usage: $0 <command> [options]"
     echo ""
-    echo "Options:"
-    echo "  -d, --domain              Domain name for routing (Mandatory for install)"
-    echo "  -e, --email               Let's Encrypt admin email (Default: admin@example.com)"
-    echo "  -u, --mongo-user          MongoDB admin username (Default: admin_user)"
-    echo "  -p, --mongo-password      MongoDB admin password (Default: auto-generated)"
-    echo "  -y, --non-interactive     Force uninstall without prompting (Automatic cleanup of files)"
-    echo "  --app-parameter           Pass environment variables to app (e.g. --app-parameter \"K=V\")"
-    echo "  --app-secret              Pass sensitive secrets to app via Podman Secrets (e.g. --app-secret \"K=V\")"
-    echo "  --cpu                     CPU limit constraints (e.g. --cpu \"0.5\")"
-    echo "  --memory                  Memory limit constraints (e.g. --memory \"512M\")"
-    echo "  --clear-app-parameters    For configure: discard existing app parameters"
-    echo "  --clear-app-secrets       For configure: discard existing app secrets"
-    echo "  --clear-app-limits        For configure: discard existing CPU and memory limits"
-    echo "  --image                   For update: change the container image URL"
-    echo "  --app-name                Select single application context"
-    echo "  --backup-name             Name of database backup file"
-    echo "  --description             Optional description suffix for backup file"
-    echo "  --all                     Target all deployed applications"
-    exit 1
+    echo "Commands:"
+    echo "  install      Install central infrastructure (Traefik, MongoDB)"
+    echo "  uninstall    Uninstall infrastructure and cleanup"
+    echo "  create-app   Deploy a new web application"
+    echo "  list         List all deployed applications"
+    echo "  start        Start a stopped application"
+    echo "  stop         Stop a running application"
+    echo "  restart      Restart an application"
+    echo "  logs         Show logs of an application"
+    echo "  configure    Update application configuration"
+    echo "  update       Update application image"
+    echo "  destroy-app  Destroy an application and its resources"
+    echo "  backup       Backup application databases"
+    echo "  restore      Restore application databases from backups"
+    echo "  completion   Generate shell autocompletion script"
+    echo "  help         Show detailed help for a subcommand"
+    echo ""
+    echo "Run '$0 <command> --help' or '$0 help <command>' for detailed help on a command."
+    exit "$exit_code"
+}
+
+show_command_help() {
+    local cmd="$1"
+    local exit_code="${2:-1}"
+    case "$cmd" in
+        install)
+            echo "Usage: $0 install -d <domain> [-e <email>] [-u <mongo-user>] [-p <mongo-password>]"
+            echo ""
+            echo "Install central infrastructure (Traefik edge router, shared MongoDB database)."
+            echo ""
+            echo "Options:"
+            echo "  -d, --domain          Domain name for routing (Mandatory)"
+            echo "  -e, --email           Let's Encrypt admin email (Default: admin@example.com)"
+            echo "  -u, --mongo-user      MongoDB admin username (Default: admin_user)"
+            echo "  -p, --mongo-password  MongoDB admin password (Default: auto-generated)"
+            ;;
+        uninstall)
+            echo "Usage: $0 uninstall [-y|--non-interactive] [--keep-apps | --destroy-apps]"
+            echo ""
+            echo "Uninstall infrastructure services, network configurations, and files."
+            echo ""
+            echo "Options:"
+            echo "  -y, --non-interactive Force uninstall without prompting (Automatic cleanup of files)"
+            echo "  --keep-apps           Retain all application databases, secrets, backups, and parameters"
+            echo "  --destroy-apps        Completely purge all applications, parameters, secrets, databases, and backups"
+            ;;
+        create-app)
+            echo "Usage: $0 create-app <image> [options]"
+            echo ""
+            echo "Deploy a new containerized application and set up database/routing rules."
+            echo ""
+            echo "Options:"
+            echo "  --app-parameter                  Pass environment variables to app (e.g. --app-parameter \"K=V\")"
+            echo "  --app-secret                     Pass sensitive secrets to app via Podman Secrets (e.g. --app-secret \"K=V\")"
+            echo "  --cpu                            CPU limit constraints (e.g. --cpu \"0.5\")"
+            echo "  --memory                         Memory limit constraints (e.g. --memory \"512M\")"
+            echo "  --use-existing-parameters        Re-use existing parameters if leftovers are found"
+            echo "  --disregard-existing-parameters   Discard/overwrite existing parameters if leftovers are found"
+            echo "  --use-existing-secrets           Re-use existing Podman secrets if leftovers are found"
+            echo "  --disregard-existing-secrets      Discard/re-create existing Podman secrets if leftovers are found"
+            echo "  --use-existing-data              Re-use existing database and user in MongoDB if leftovers are found"
+            echo "  --disregard-existing-data         Drop and re-create database and user in MongoDB if leftovers are found"
+            ;;
+        list)
+            echo "Usage: $0 list"
+            echo ""
+            echo "List all deployed applications, their routing URLs, and container status."
+            ;;
+        start)
+            echo "Usage: $0 start <app-name>"
+            echo ""
+            echo "Start a stopped application's containers."
+            ;;
+        stop)
+            echo "Usage: $0 stop <app-name>"
+            echo ""
+            echo "Stop a running application's containers."
+            ;;
+        restart)
+            echo "Usage: $0 restart <app-name>"
+            echo ""
+            echo "Restart an application (recreates containers to apply config updates)."
+            ;;
+        logs)
+            echo "Usage: $0 logs <app-name> [compose-options...]"
+            echo ""
+            echo "Show logs of an application container (supports all podman-compose log options like -f, --tail)."
+            ;;
+        configure)
+            echo "Usage: $0 configure <app-name> [options]"
+            echo ""
+            echo "Update configuration parameters, secrets, or resource constraints of an app."
+            echo ""
+            echo "Options:"
+            echo "  --app-parameter         Pass environment variables to app (e.g. --app-parameter \"K=V\")"
+            echo "  --app-secret            Pass sensitive secrets to app via Podman Secrets (e.g. --app-secret \"K=V\")"
+            echo "  --cpu                   CPU limit constraints (e.g. --cpu \"0.5\")"
+            echo "  --memory                Memory limit constraints (e.g. --memory \"512M\")"
+            echo "  --clear-app-parameters  Discard existing app parameters"
+            echo "  --clear-app-secrets     Discard existing app secrets"
+            echo "  --clear-app-limits      Discard existing CPU and memory limits"
+            ;;
+        update)
+            echo "Usage: $0 update <app-name> [--image <new-image-url>]"
+            echo ""
+            echo "Update the container image URL and re-deploy the application."
+            echo ""
+            echo "Options:"
+            echo "  --image <new-image-url> Change the container image URL to the specified one"
+            ;;
+        destroy-app)
+            echo "Usage: $0 destroy-app <app-name> [options]"
+            echo ""
+            echo "Halt services and permanently destroy app configurations, secrets, database, or backups."
+            echo ""
+            echo "Options:"
+            echo "  --keep-secrets | --delete-secrets      Keep or delete registered Podman secrets"
+            echo "  --keep-parameters | --delete-parameters Keep or delete configuration parameters"
+            echo "  --keep-data | --delete-data            Keep or drop database and database user in MongoDB"
+            echo "  --keep-backups | --delete-backups      Keep or delete database backup files"
+            ;;
+        backup)
+            echo "Usage: $0 backup [--app-name=<name> | --all] [--description=<suffix>]"
+            echo ""
+            echo "Backup databases of one or all deployed applications using mongodump."
+            echo ""
+            echo "Options:"
+            echo "  --app-name=<name>     Select single application context"
+            echo "  --all                 Target all deployed applications"
+            echo "  --description=<suffix> Optional description suffix for the backup file name"
+            echo "                         (Only alphanumeric characters, hyphens, and underscores are allowed)"
+            ;;
+        restore)
+            echo "Usage: $0 restore [--app-name=<name> --backup-name=<file> | --all]"
+            echo ""
+            echo "Restore database of one or all deployed applications using mongorestore."
+            echo ""
+            echo "Options:"
+            echo "  --app-name=<name>     Select single application context"
+            echo "  --backup-name=<file>  Name of database backup file (Mandatory when restoring a single application)"
+            echo "  --all                 Target all deployed applications (Restores latest backup for each)"
+            ;;
+        completion)
+            echo "Usage: $0 completion generate"
+            echo ""
+            echo "Generate shell autocompletion script for Bash."
+            echo ""
+            echo "To enable autocompletion, run:"
+            echo "  source <( $0 completion generate )"
+            echo ""
+            echo "To make it permanent, run either one of the following commands:"
+            echo "    echo 'source <( /path/to/appRouter.sh completion generate )' >> ~/.bashrc"
+            echo "    ./appRouter.sh completion generate >> ~/.bash_completion"
+            ;;
+        *)
+            log_error "Unknown command: $cmd"
+            echo "Run '$0 --help' to see list of valid commands."
+            exit_code=1
+            ;;
+    esac
+    exit "$exit_code"
 }
 
 # Ensure action is provided
@@ -80,12 +314,33 @@ if [ $# -lt 1 ]; then
 fi
 
 ACTION=$1
+
+# Handle progressive help if ACTION is help
+if [ "$ACTION" = "help" ]; then
+    if [ -n "$2" ]; then
+        show_command_help "$2" 0
+    else
+        show_usage 0
+    fi
+fi
+
+if [ "$ACTION" = "--help" ] || [ "$ACTION" = "-h" ]; then
+    show_usage 0
+fi
+
+# Also check if any subcommand arguments contain --help or -h
+for arg in "$@"; do
+    if [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
+        show_command_help "$ACTION" 0
+    fi
+done
+
 shift
 
 # Defaults
 APP_DOMAIN=""
 LETSENCRYPT_EMAIL="admin@example.com"
-MONGO_ROOT_USER="admin_user"
+MONGO_ROOT_USER=""
 MONGO_ROOT_PASSWORD=""
 NON_INTERACTIVE=false
 APP_IMAGE=""
@@ -106,25 +361,35 @@ DESTROY_BACKUPS=""
 ALL_APPS=false
 BACKUP_DESC=""
 BACKUP_NAME=""
+USE_EXISTING_PARAMS=false
+DISREGARD_EXISTING_PARAMS=false
+USE_EXISTING_SECRETS=false
+DISREGARD_EXISTING_SECRETS=false
+USE_EXISTING_DATA=false
+DISREGARD_EXISTING_DATA=false
+UNINSTALL_APPS_ACTION=""
+
+
 
 if [ "$ACTION" = "create-app" ]; then
-    if [ $# -lt 1 ]; then
-        log_error "Missing image name for create-app."
-        show_usage
-    fi
-    APP_IMAGE="$1"
-    shift
-    
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --app-parameter)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --app-parameter"
-                    show_usage
+                    show_command_help "$ACTION"
+                fi
+                if [[ "$2" != *=* ]]; then
+                    log_error "App parameter must be in KEY=VALUE format: $2"
+                    exit 1
                 fi
                 PARAM_KEY="${2%%=*}"
-                if [[ "$PARAM_KEY" =~ ^(PORT|NODE_ENV|APP_DOMAIN)$ ]]; then
+                if [[ "$PARAM_KEY" =~ ^(PORT|APP_ENV|APP_DOMAIN|APP_CPUS|APP_MEM_LIMIT|MONGO_URI|MONGO_ROOT_USER|MONGO_ROOT_PASSWORD)$ ]]; then
                     log_error "Parameter '$PARAM_KEY' is a reserved gateway configuration and cannot be overridden."
+                    exit 1
+                fi
+                if [[ ! "$PARAM_KEY" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                    log_error "Parameter key '$PARAM_KEY' contains invalid characters. Only alphanumerics, hyphens, dots, and underscores are allowed."
                     exit 1
                 fi
                 APP_PARAMS+=("$2")
@@ -133,7 +398,16 @@ if [ "$ACTION" = "create-app" ]; then
             --app-secret)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --app-secret"
-                    show_usage
+                    show_command_help "$ACTION"
+                fi
+                if [[ "$2" != *=* ]]; then
+                    log_error "App secret must be in KEY=VALUE format: $2"
+                    exit 1
+                fi
+                PARAM_KEY="${2%%=*}"
+                if [[ ! "$PARAM_KEY" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                    log_error "Secret key '$PARAM_KEY' contains invalid characters. Only alphanumerics, hyphens, dots, and underscores are allowed."
+                    exit 1
                 fi
                 APP_SECRETS+=("$2")
                 shift 2
@@ -141,7 +415,11 @@ if [ "$ACTION" = "create-app" ]; then
             --cpu)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --cpu"
-                    show_usage
+                    show_command_help "$ACTION"
+                fi
+                if [[ ! "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                    log_error "Invalid CPU limit: '$2'. Must be a positive decimal or integer (e.g. 0.5 or 2)."
+                    exit 1
                 fi
                 APP_CPU="$2"
                 shift 2
@@ -149,35 +427,91 @@ if [ "$ACTION" = "create-app" ]; then
             --memory)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --memory"
-                    show_usage
+                    show_command_help "$ACTION"
+                fi
+                if [[ ! "$2" =~ ^[0-9]+[bBkKmMgG]?$ ]]; then
+                    log_error "Invalid memory limit: '$2'. Must be a number optionally followed by a unit (e.g. 512M, 2G)."
+                    exit 1
                 fi
                 APP_MEM="$2"
                 shift 2
                 ;;
+            --use-existing-parameters)
+                USE_EXISTING_PARAMS=true
+                shift
+                ;;
+            --disregard-existing-parameters)
+                DISREGARD_EXISTING_PARAMS=true
+                shift
+                ;;
+            --use-existing-secrets)
+                USE_EXISTING_SECRETS=true
+                shift
+                ;;
+            --disregard-existing-secrets)
+                DISREGARD_EXISTING_SECRETS=true
+                shift
+                ;;
+            --use-existing-data)
+                USE_EXISTING_DATA=true
+                shift
+                ;;
+            --disregard-existing-data)
+                DISREGARD_EXISTING_DATA=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option for create-app: $1"
+                show_command_help "$ACTION"
+                ;;
             *)
-                log_error "Unknown argument for create-app: $1"
-                show_usage
+                if [ -n "$APP_IMAGE" ]; then
+                    log_error "Multiple image names specified: $APP_IMAGE and $1"
+                    exit 1
+                fi
+                APP_IMAGE="$1"
+                shift
                 ;;
         esac
     done
-elif [ "$ACTION" = "configure" ]; then
-    if [ $# -lt 1 ]; then
-        log_error "Missing app-name for configure."
-        show_usage
+
+    if [ -z "$APP_IMAGE" ]; then
+        log_error "Missing image name for create-app."
+        show_command_help "$ACTION"
     fi
-    APP_NAME="$1"
-    shift
-    
+
+    # Validate mutually exclusive options
+    if [ "$USE_EXISTING_PARAMS" = true ] && [ "$DISREGARD_EXISTING_PARAMS" = true ]; then
+        log_error "Cannot specify both --use-existing-parameters and --disregard-existing-parameters."
+        exit 1
+    fi
+    if [ "$USE_EXISTING_SECRETS" = true ] && [ "$DISREGARD_EXISTING_SECRETS" = true ]; then
+        log_error "Cannot specify both --use-existing-secrets and --disregard-existing-secrets."
+        exit 1
+    fi
+    if [ "$USE_EXISTING_DATA" = true ] && [ "$DISREGARD_EXISTING_DATA" = true ]; then
+        log_error "Cannot specify both --use-existing-data and --disregard-existing-data."
+        exit 1
+    fi
+elif [ "$ACTION" = "configure" ]; then
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --app-parameter)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --app-parameter"
-                    show_usage
+                    show_command_help "$ACTION"
+                fi
+                if [[ "$2" != *=* ]]; then
+                    log_error "App parameter must be in KEY=VALUE format: $2"
+                    exit 1
                 fi
                 PARAM_KEY="${2%%=*}"
-                if [[ "$PARAM_KEY" =~ ^(PORT|NODE_ENV|APP_DOMAIN)$ ]]; then
+                if [[ "$PARAM_KEY" =~ ^(PORT|APP_ENV|APP_DOMAIN|APP_CPUS|APP_MEM_LIMIT|MONGO_URI|MONGO_ROOT_USER|MONGO_ROOT_PASSWORD)$ ]]; then
                     log_error "Parameter '$PARAM_KEY' is a reserved gateway configuration and cannot be overridden."
+                    exit 1
+                fi
+                if [[ ! "$PARAM_KEY" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                    log_error "Parameter key '$PARAM_KEY' contains invalid characters. Only alphanumerics, hyphens, dots, and underscores are allowed."
                     exit 1
                 fi
                 APP_PARAMS+=("$2")
@@ -186,7 +520,16 @@ elif [ "$ACTION" = "configure" ]; then
             --app-secret)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --app-secret"
-                    show_usage
+                    show_command_help "$ACTION"
+                fi
+                if [[ "$2" != *=* ]]; then
+                    log_error "App secret must be in KEY=VALUE format: $2"
+                    exit 1
+                fi
+                PARAM_KEY="${2%%=*}"
+                if [[ ! "$PARAM_KEY" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                    log_error "Secret key '$PARAM_KEY' contains invalid characters. Only alphanumerics, hyphens, dots, and underscores are allowed."
+                    exit 1
                 fi
                 APP_SECRETS+=("$2")
                 shift 2
@@ -194,7 +537,11 @@ elif [ "$ACTION" = "configure" ]; then
             --cpu)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --cpu"
-                    show_usage
+                    show_command_help "$ACTION"
+                fi
+                if [[ ! "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                    log_error "Invalid CPU limit: '$2'. Must be a positive decimal or integer (e.g. 0.5 or 2)."
+                    exit 1
                 fi
                 APP_CPU="$2"
                 shift 2
@@ -202,7 +549,11 @@ elif [ "$ACTION" = "configure" ]; then
             --memory)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --memory"
-                    show_usage
+                    show_command_help "$ACTION"
+                fi
+                if [[ ! "$2" =~ ^[0-9]+[bBkKmMgG]?$ ]]; then
+                    log_error "Invalid memory limit: '$2'. Must be a number optionally followed by a unit (e.g. 512M, 2G)."
+                    exit 1
                 fi
                 APP_MEM="$2"
                 shift 2
@@ -219,44 +570,56 @@ elif [ "$ACTION" = "configure" ]; then
                 CLEAR_LIMITS=true
                 shift
                 ;;
+            -*)
+                log_error "Unknown option for configure: $1"
+                show_command_help "$ACTION"
+                ;;
             *)
-                log_error "Unknown argument for configure: $1"
-                show_usage
+                if [ -n "$APP_NAME" ]; then
+                    log_error "Multiple app names specified: $APP_NAME and $1"
+                    exit 1
+                fi
+                APP_NAME="$1"
+                shift
                 ;;
         esac
     done
-elif [ "$ACTION" = "update" ]; then
-    if [ $# -lt 1 ]; then
-        log_error "Missing app-name for update."
-        show_usage
+
+    if [ -z "$APP_NAME" ]; then
+        log_error "Missing app-name for configure."
+        show_command_help "$ACTION"
     fi
-    APP_NAME="$1"
-    shift
-    
+elif [ "$ACTION" = "update" ]; then
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --image)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --image"
-                    show_usage
+                    show_command_help "$ACTION"
                 fi
                 UPDATE_IMAGE="$2"
                 shift 2
                 ;;
+            -*)
+                log_error "Unknown option for update: $1"
+                show_command_help "$ACTION"
+                ;;
             *)
-                log_error "Unknown argument for update: $1"
-                show_usage
+                if [ -n "$APP_NAME" ]; then
+                    log_error "Multiple app names specified: $APP_NAME and $1"
+                    exit 1
+                fi
+                APP_NAME="$1"
+                shift
                 ;;
         esac
     done
-elif [ "$ACTION" = "destroy-app" ]; then
-    if [ $# -lt 1 ]; then
-        log_error "Missing app-name for destroy-app."
-        show_usage
+
+    if [ -z "$APP_NAME" ]; then
+        log_error "Missing app-name for update."
+        show_command_help "$ACTION"
     fi
-    APP_NAME="$1"
-    shift
-    
+elif [ "$ACTION" = "destroy-app" ]; then
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --keep-secrets)
@@ -291,12 +654,25 @@ elif [ "$ACTION" = "destroy-app" ]; then
                 DESTROY_BACKUPS="delete"
                 shift
                 ;;
+            -*)
+                log_error "Unknown option for destroy-app: $1"
+                show_command_help "$ACTION"
+                ;;
             *)
-                log_error "Unknown argument for destroy-app: $1"
-                show_usage
+                if [ -n "$APP_NAME" ]; then
+                    log_error "Multiple app names specified: $APP_NAME and $1"
+                    exit 1
+                fi
+                APP_NAME="$1"
+                shift
                 ;;
         esac
     done
+
+    if [ -z "$APP_NAME" ]; then
+        log_error "Missing app-name for destroy-app."
+        show_command_help "$ACTION"
+    fi
     
     # Enforce mandatory choices
     if [ -z "$DESTROY_SECRETS" ] || [ -z "$DESTROY_PARAMS" ] || [ -z "$DESTROY_DATA" ] || [ -z "$DESTROY_BACKUPS" ]; then
@@ -318,7 +694,7 @@ elif [ "$ACTION" = "backup" ] || [ "$ACTION" = "restore" ]; then
             --app-name)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --app-name"
-                    show_usage
+                    show_command_help "$ACTION"
                 fi
                 APP_NAME="$2"
                 shift 2
@@ -330,7 +706,7 @@ elif [ "$ACTION" = "backup" ] || [ "$ACTION" = "restore" ]; then
             --description)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --description"
-                    show_usage
+                    show_command_help "$ACTION"
                 fi
                 BACKUP_DESC="$2"
                 shift 2
@@ -342,7 +718,7 @@ elif [ "$ACTION" = "backup" ] || [ "$ACTION" = "restore" ]; then
             --backup-name)
                 if [ -z "$2" ]; then
                     log_error "Missing value for --backup-name"
-                    show_usage
+                    show_command_help "$ACTION"
                 fi
                 BACKUP_NAME="$2"
                 shift 2
@@ -353,7 +729,7 @@ elif [ "$ACTION" = "backup" ] || [ "$ACTION" = "restore" ]; then
                 ;;
             *)
                 log_error "Unknown argument for $ACTION: $1"
-                show_usage
+                show_command_help "$ACTION"
                 ;;
         esac
     done
@@ -374,18 +750,18 @@ elif [ "$ACTION" = "backup" ] || [ "$ACTION" = "restore" ]; then
 elif [ "$ACTION" = "start" ] || [ "$ACTION" = "stop" ] || [ "$ACTION" = "restart" ]; then
     if [ $# -lt 1 ]; then
         log_error "Missing app-name for $ACTION."
-        show_usage
+        show_command_help "$ACTION"
     fi
     APP_NAME="$1"
     shift
     if [ $# -gt 0 ]; then
         log_error "Too many arguments for $ACTION: $@"
-        show_usage
+        show_command_help "$ACTION"
     fi
 elif [ "$ACTION" = "logs" ]; then
     if [ $# -lt 1 ]; then
         log_error "Missing app-name for logs."
-        show_usage
+        show_command_help "$ACTION"
     fi
     APP_NAME="$1"
     shift
@@ -393,35 +769,91 @@ elif [ "$ACTION" = "logs" ]; then
 elif [ "$ACTION" = "list" ]; then
     if [ $# -gt 0 ]; then
         log_error "Too many arguments for list: $@"
-        show_usage
+        show_command_help "$ACTION"
     fi
-else
-    # Parse named parameters for install/uninstall
+elif [ "$ACTION" = "completion" ]; then
+    if [ $# -lt 1 ]; then
+        show_command_help "$ACTION" 0
+    fi
+    SUB_ACTION="$1"
+    shift
+    if [ "$SUB_ACTION" != "generate" ]; then
+        log_error "Unknown argument for completion: $SUB_ACTION"
+        show_command_help "$ACTION"
+    fi
+    if [ $# -gt 0 ]; then
+        log_error "Too many arguments for completion generate."
+        show_command_help "$ACTION"
+    fi
+elif [ "$ACTION" = "install" ]; then
+    # Parse named parameters for install
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -d|--domain)
+                if [ -z "$2" ]; then
+                    log_error "Missing value for -d/--domain"
+                    show_command_help "$ACTION"
+                fi
                 APP_DOMAIN="$2"
                 shift 2
                 ;;
             -e|--email)
+                if [ -z "$2" ]; then
+                    log_error "Missing value for -e/--email"
+                    show_command_help "$ACTION"
+                fi
                 LETSENCRYPT_EMAIL="$2"
                 shift 2
                 ;;
             -u|--mongo-user)
+                if [ -z "$2" ]; then
+                    log_error "Missing value for -u/--mongo-user"
+                    show_command_help "$ACTION"
+                fi
                 MONGO_ROOT_USER="$2"
                 shift 2
                 ;;
             -p|--mongo-password)
+                if [ -z "$2" ]; then
+                    log_error "Missing value for -p/--mongo-password"
+                    show_command_help "$ACTION"
+                fi
                 MONGO_ROOT_PASSWORD="$2"
                 shift 2
                 ;;
+            *)
+                log_error "Unknown argument for install: $1"
+                show_command_help "$ACTION"
+                ;;
+        esac
+    done
+elif [ "$ACTION" = "uninstall" ]; then
+    # Parse named parameters for uninstall
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
             -y|--non-interactive)
                 NON_INTERACTIVE=true
                 shift
                 ;;
+            --keep-apps)
+                if [ -n "$UNINSTALL_APPS_ACTION" ]; then
+                    log_error "Cannot specify both --keep-apps and --destroy-apps."
+                    exit 1
+                fi
+                UNINSTALL_APPS_ACTION="keep"
+                shift
+                ;;
+            --destroy-apps)
+                if [ -n "$UNINSTALL_APPS_ACTION" ]; then
+                    log_error "Cannot specify both --keep-apps and --destroy-apps."
+                    exit 1
+                fi
+                UNINSTALL_APPS_ACTION="destroy"
+                shift
+                ;;
             *)
-                log_error "Unknown argument: $1"
-                show_usage
+                log_error "Unknown argument for uninstall: $1"
+                show_command_help "$ACTION"
                 ;;
         esac
     done
@@ -431,7 +863,31 @@ do_install() {
     # Check mandatory parameter
     if [ -z "$APP_DOMAIN" ]; then
         log_error "Missing required parameter: -d/--domain is mandatory for install."
-        show_usage
+        show_command_help "$ACTION"
+    fi
+
+    # Reuse existing MongoDB credentials if installer is re-run and CLI arguments were not explicitly passed
+    local env_file_path="$INFRA_DIR/.env"
+    if [ -f "$env_file_path" ]; then
+        set +e
+        local existing_user
+        local existing_pass
+        existing_user=$(grep "^MONGO_ROOT_USER=" "$env_file_path" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        existing_pass=$(grep "^MONGO_ROOT_PASSWORD=" "$env_file_path" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+        set -e
+        if [ -n "$existing_user" ] && [ -z "$MONGO_ROOT_USER" ]; then
+            MONGO_ROOT_USER="$existing_user"
+            log_info "Reusing existing MongoDB root user from $env_file_path."
+        fi
+        if [ -n "$existing_pass" ] && [ -z "$MONGO_ROOT_PASSWORD" ]; then
+            MONGO_ROOT_PASSWORD="$existing_pass"
+            log_info "Reusing existing MongoDB root password from $env_file_path."
+        fi
+    fi
+
+    # Set fallback default user if not loaded or specified
+    if [ -z "$MONGO_ROOT_USER" ]; then
+        MONGO_ROOT_USER="admin_user"
     fi
 
     # Handle auto-password generation if not provided
@@ -448,24 +904,79 @@ do_install() {
     echo ""
 
     log_info "1. Installing OS dependencies..."
-    sudo apt update
-    sudo apt install -y git podman podman-compose gnupg pass jq
+    if command -v apt-get &>/dev/null; then
+        log_info "Debian/Ubuntu detected. Installing dependencies via apt-get..."
+        sudo apt update
+        sudo apt install -y git podman podman-compose gnupg pass jq
+    elif command -v dnf &>/dev/null; then
+        log_info "RHEL/Rocky/Fedora detected..."
+        # Fedora has podman-compose in base; RHEL/Rocky require EPEL
+        if ! grep -qi "fedora" /etc/os-release 2>/dev/null; then
+            if ! dnf repolist | grep -iq "epel"; then
+                log_error "EPEL repository is not enabled. Rocky/RHEL requires EPEL to install 'podman-compose' and 'pass'."
+                log_error "Please enable it first (e.g., 'sudo dnf install epel-release') and retry."
+                exit 1
+            fi
+        fi
+        log_info "Installing dependencies via dnf..."
+        sudo dnf install -y git podman podman-compose gnupg2 pass jq
+    elif command -v yum &>/dev/null; then
+        log_info "RHEL/CentOS detected..."
+        if ! yum repolist | grep -iq "epel"; then
+            log_error "EPEL repository is not enabled. RHEL/CentOS requires EPEL to install 'podman-compose' and 'pass'."
+            log_error "Please enable it first (e.g., 'sudo yum install epel-release') and retry."
+            exit 1
+        fi
+        log_info "Installing dependencies via yum..."
+        sudo yum install -y git podman podman-compose gnupg2 pass jq
+    elif command -v zypper &>/dev/null; then
+        log_info "openSUSE detected. Installing dependencies via zypper..."
+        sudo zypper install -y git podman podman-compose gnupg2 pass jq
+    elif command -v pacman &>/dev/null; then
+        log_info "Arch Linux detected. Installing dependencies via pacman..."
+        sudo pacman -S --noconfirm git podman podman-compose gnupg pass jq
+    else
+        log_error "Unsupported package manager. Please manually install the dependencies: git, podman, podman-compose, gnupg, pass, jq"
+        exit 1
+    fi
+
+    log_info "Configuring unprivileged port access for ports 80 and 443..."
+    sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
+    echo "net.ipv4.ip_unprivileged_port_start=80" | sudo tee /etc/sysctl.d/99-podman-ports.conf > /dev/null
 
     log_info "2. Enabling and starting Podman user socket and restart service..."
     # Enable lingering to allow user services to run when not logged in
     sudo loginctl enable-linger "$(whoami)"
     systemctl --user daemon-reload
     systemctl --user enable --now podman.socket
+
+    # Check if podman-restart.service exists before enabling
+    log_info "Checking if podman-restart.service is registered for systemd user services..."
+    if ! systemctl --user list-unit-files --type=service | grep -q "podman-restart"; then
+        log_error "podman-restart.service is missing or not registered for systemd user services."
+        log_error "This service is required to auto-restart containers upon system reboot."
+        log_error "Please make sure Podman is installed correctly and user services are supported."
+        exit 1
+    fi
     systemctl --user enable --now podman-restart.service
 
-    # Verify socket status
+    # Verify socket status (with wait/retry loop)
     SOCKET_PATH="/run/user/$(id -u)/podman/podman.sock"
-    if [ ! -S "$SOCKET_PATH" ]; then
-        log_warn "Podman socket not found at expected path: $SOCKET_PATH"
-        log_warn "Traefik might fail to dynamically discover containers until the socket is active."
-    else
-        log_success "Podman user socket is running at $SOCKET_PATH"
-    fi
+    local socket_attempts=10
+    local socket_wait=1
+    log_info "Waiting for Podman user socket to become active at $SOCKET_PATH..."
+    for ((i=1; i<=socket_attempts; i++)); do
+        if [ -S "$SOCKET_PATH" ]; then
+            log_success "Podman user socket is active at $SOCKET_PATH."
+            break
+        fi
+        if [ "$i" -eq "$socket_attempts" ]; then
+            log_warn "Timeout: Podman socket not found or not active at $SOCKET_PATH after ${socket_attempts}s."
+            log_warn "Traefik might fail to dynamically discover containers until the socket is active."
+        else
+            sleep "$socket_wait"
+        fi
+    done
 
     log_info "3. Creating directory structure at $INFRA_DIR..."
     sudo mkdir -p "$INFRA_DIR/letsencrypt"
@@ -486,11 +997,11 @@ do_install() {
     # Write .env file
     ENV_FILE="$INFRA_DIR/.env"
     cat <<EOF > "$ENV_FILE"
-APP_DOMAIN=${APP_DOMAIN}
-LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
-USER_UID=$(id -u)
-MONGO_ROOT_USER=${MONGO_ROOT_USER}
-MONGO_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+APP_DOMAIN="${APP_DOMAIN}"
+LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL}"
+USER_UID="$(id -u)"
+MONGO_ROOT_USER="${MONGO_ROOT_USER}"
+MONGO_ROOT_PASSWORD="${MONGO_ROOT_PASSWORD}"
 EOF
     chmod 600 "$ENV_FILE"
 
@@ -512,6 +1023,32 @@ EOF
 }
 
 do_uninstall() {
+    # Check mandatory retention flag
+    if [ -z "$UNINSTALL_APPS_ACTION" ]; then
+        if [ "$NON_INTERACTIVE" = false ]; then
+            log_warn "No application retention policy specified."
+            echo "Select retention policy for deployed applications:"
+            echo "  [1] Keep (retain all application databases, secrets, backups, and parameters)"
+            echo "  [2] Destroy (completely purge all applications, parameters, secrets, databases, and backups)"
+            read -r -p "Enter choice [1 or 2]: " RETENTION_CHOICE
+            case "$RETENTION_CHOICE" in
+                1)
+                    UNINSTALL_APPS_ACTION="keep"
+                    ;;
+                2)
+                    UNINSTALL_APPS_ACTION="destroy"
+                    ;;
+                *)
+                    log_error "Invalid choice. Uninstall aborted."
+                    exit 1
+                    ;;
+            esac
+        else
+            log_error "Missing mandatory uninstall flag: --keep-apps or --destroy-apps must be specified in non-interactive mode."
+            show_command_help "$ACTION"
+        fi
+    fi
+
     if [ "$NON_INTERACTIVE" = false ]; then
         log_warn "This will stop services and delete configurations."
         read -r -p "Are you sure you want to uninstall? [y/N]: " CONFIRM
@@ -521,24 +1058,80 @@ do_uninstall() {
         fi
     fi
 
-    log_info "1. Stopping services..."
+    if [ "$UNINSTALL_APPS_ACTION" = "destroy" ]; then
+        log_info "1. Completely destroying all deployed applications..."
+        # Set destroy flags to delete all application components
+        DESTROY_SECRETS="delete"
+        DESTROY_PARAMS="delete"
+        DESTROY_DATA="delete"
+        DESTROY_BACKUPS="delete"
+        export GLOBAL_UNINSTALL="true"
+        
+        declare -a APP_DESTROY_FAILURES=()
+        for dir in /opt/*; do
+            [ -d "$dir" ] || continue
+            APP_DIR_NAME=$(basename "$dir")
+            [ "$APP_DIR_NAME" = "web-infrastructure" ] && continue
+            
+            COMPOSE_PATH="$dir/docker-compose.prod.yml"
+            if [ -f "$COMPOSE_PATH" ]; then
+                log_info "Destroying application '$APP_DIR_NAME'..."
+                if ! ( do_destroy_app "$APP_DIR_NAME" ); then
+                    log_warn "Failed to fully destroy application '$APP_DIR_NAME'."
+                    APP_DESTROY_FAILURES+=("$APP_DIR_NAME")
+                fi
+            fi
+        done
+        if [ ${#APP_DESTROY_FAILURES[@]} -gt 0 ]; then
+            log_error "The following applications were not fully destroyed: ${APP_DESTROY_FAILURES[*]}"
+        fi
+    else
+        log_info "1. Stopping all deployed applications (keeping configuration, data, secrets, and backups)..."
+        for dir in /opt/*; do
+            [ -d "$dir" ] || continue
+            APP_DIR_NAME=$(basename "$dir")
+            [ "$APP_DIR_NAME" = "web-infrastructure" ] && continue
+            
+            COMPOSE_PATH="$dir/docker-compose.prod.yml"
+            if [ -f "$COMPOSE_PATH" ]; then
+                log_info "Stopping application '$APP_DIR_NAME'..."
+                (cd "$dir" && podman-compose -f docker-compose.prod.yml down) || true
+            fi
+        done
+    fi
+
+    log_info "2. Stopping infrastructure services..."
     if [ -f "$INFRA_DIR/docker-compose.yml" ]; then
         cd "$INFRA_DIR"
-        podman-compose down || true
+        if [ "$UNINSTALL_APPS_ACTION" = "destroy" ]; then
+            log_info "Removing infrastructure containers and database volumes..."
+            podman-compose down -v || true
+        else
+            podman-compose down || true
+        fi
     else
         log_warn "docker-compose.yml not found at $INFRA_DIR, skipping service teardown."
     fi
 
-    log_info "2. Removing network 'web_gateway'..."
+    log_info "3. Removing network 'web_gateway'..."
     if podman network inspect web_gateway >/dev/null 2>&1; then
         podman network rm web_gateway || true
     fi
 
-    log_info "3. Disabling Podman user socket and restart services..."
+    if [ "$UNINSTALL_APPS_ACTION" = "destroy" ]; then
+        log_info "4. Removing all registered Podman secrets..."
+        for s in $(podman secret ls --format "{{.Name}}" 2>/dev/null | grep -E "_mongo_uri$|_secret_"); do
+            podman secret rm "$s" >/dev/null 2>&1 || true
+        done
+    else
+        log_info "4. Keeping registered Podman secrets intact."
+    fi
+
+    log_info "5. Disabling Podman user socket and restart services..."
     systemctl --user disable --now podman.socket || true
     systemctl --user disable --now podman-restart.service || true
 
-    log_info "4. Cleaning up files..."
+    log_info "6. Cleaning up files..."
     CLEAN_ALL=true
     if [ "$NON_INTERACTIVE" = false ]; then
         read -r -p "Do you want to delete all configuration, SSL certs, and MongoDB databases at $INFRA_DIR? [y/N]: " CLEAN_PROMPT
@@ -567,9 +1160,10 @@ do_create_app() {
     # Extract base image name
     IMAGE_BASE="${IMAGE##*/}"
     APP_NAME="${IMAGE_BASE%%:*}"
-    APP_NAME=$(echo "$APP_NAME" | tr '.' '-')
+    APP_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
     # Ensure database name uses underscores instead of hyphens/periods
     DB_NAME=$(echo "$APP_NAME" | tr '-' '_' | tr '.' '_')_db
+    APP_DB_USER="user_$(echo "$APP_NAME" | tr '-' '_' | tr '.' '_')"
     
     APP_DIR="/opt/$APP_NAME"
     ENV_FILE="$INFRA_DIR/.env"
@@ -582,9 +1176,9 @@ do_create_app() {
     
     # Extract root mongo credentials and APP_DOMAIN
     set +e
-    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
-    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
-    APP_DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
+    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    APP_DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
     set -e
     
     if [ -z "$MONGO_ROOT_USER" ] || [ -z "$MONGO_ROOT_PASSWORD" ]; then
@@ -596,67 +1190,224 @@ do_create_app() {
         exit 1
     fi
 
+    # --- Leftovers Verification & Handling ---
+    local parameters_exist=false
+    local secrets_exist=false
+    local data_exist=false
+
+    # Check parameters leftover
+    if [ -d "$APP_DIR" ] && ( [ -f "$APP_DIR/docker-compose.prod.yml" ] || [ -f "$APP_DIR/.env.production" ] ); then
+        parameters_exist=true
+    fi
+
+    # Check secrets leftover
+    if podman secret inspect "${APP_NAME}_mongo_uri" >/dev/null 2>&1; then
+        secrets_exist=true
+    fi
+    if podman secret ls --format "{{.Name}}" 2>/dev/null | grep -q "^${APP_NAME}_secret_"; then
+        secrets_exist=true
+    fi
+
+    # Check data leftover
+    if podman ps --format "{{.Names}}" | grep -q "^shared_production_mongodb$"; then
+        verify_mongodb_ready
+        local mongo_check
+        mongo_check=$(podman exec -i \
+            -e DB_NAME="${DB_NAME}" \
+            -e APP_DB_USER="${APP_DB_USER}" \
+            shared_production_mongodb mongosh \
+            -u "$MONGO_ROOT_USER" \
+            -p "$MONGO_ROOT_PASSWORD" \
+            --authenticationDatabase admin \
+            --quiet \
+            --eval "
+                var dbName = process.env.DB_NAME;
+                var userExists = db.getSiblingDB(dbName).getUser(process.env.APP_DB_USER) !== null;
+                var dbExists = false;
+                try {
+                    var dbList = db.adminCommand('listDatabases').databases;
+                    for (var i = 0; i < dbList.length; i++) {
+                        if (dbList[i].name === dbName) { dbExists = true; break; }
+                    }
+                } catch (e) {
+                    dbExists = userExists;
+                }
+                print(userExists + ',' + dbExists);
+            " 2>/dev/null | grep -E '^(true|false),(true|false)' | tr -d '[:space:]')
+        if [ -z "$mongo_check" ]; then
+            mongo_check="false,false"
+        fi
+        
+        local user_exists="${mongo_check%%,*}"
+        local db_exists="${mongo_check#*,}"
+        if [ "$user_exists" = "true" ] || [ "$db_exists" = "true" ]; then
+            data_exist=true
+        fi
+    fi
+
+    # Enforce flags
+    local validation_failed=false
+    if [ "$parameters_exist" = true ] && [ "$USE_EXISTING_PARAMS" = false ] && [ "$DISREGARD_EXISTING_PARAMS" = false ]; then
+        log_error "Leftover workspace parameters detected at $APP_DIR."
+        log_error "Please re-run with either --use-existing-parameters or --disregard-existing-parameters."
+        validation_failed=true
+    fi
+    if [ "$secrets_exist" = true ] && [ "$USE_EXISTING_SECRETS" = false ] && [ "$DISREGARD_EXISTING_SECRETS" = false ]; then
+        log_error "Leftover Podman secrets detected for application '$APP_NAME'."
+        log_error "Please re-run with either --use-existing-secrets or --disregard-existing-secrets."
+        validation_failed=true
+    fi
+    if [ "$data_exist" = true ] && [ "$USE_EXISTING_DATA" = false ] && [ "$DISREGARD_EXISTING_DATA" = false ]; then
+        log_error "Leftover database data or user detected in MongoDB for database '$DB_NAME'."
+        log_error "Please re-run with either --use-existing-data or --disregard-existing-data."
+        validation_failed=true
+    fi
+
+    if [ "$validation_failed" = true ]; then
+        exit 1
+    fi
+
+    # Execute Leftovers Cleanup or Preparation
+    if [ "$parameters_exist" = true ] && [ "$DISREGARD_EXISTING_PARAMS" = true ]; then
+        log_info "Cleaning up existing configuration parameters in '$APP_DIR'..."
+        if [ -d "$APP_DIR/backups" ]; then
+            sudo find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name "backups" -exec rm -rf {} +
+        else
+            sudo rm -rf "$APP_DIR"
+        fi
+    fi
+
+    if [ "$secrets_exist" = true ] && [ "$DISREGARD_EXISTING_SECRETS" = true ]; then
+        log_info "Cleaning up existing secrets from Podman..."
+        podman secret rm "${APP_NAME}_mongo_uri" >/dev/null 2>&1 || true
+        for s in $(podman secret ls --format "{{.Name}}" 2>/dev/null | grep "^${APP_NAME}_secret_"); do
+            podman secret rm "$s" >/dev/null 2>&1 || true
+        done
+    fi
+
+    if [ "$data_exist" = true ] && [ "$DISREGARD_EXISTING_DATA" = true ]; then
+        log_info "Dropping existing database and user from MongoDB..."
+        podman exec -i \
+            -e DB_NAME="${DB_NAME}" \
+            -e APP_DB_USER="${APP_DB_USER}" \
+            shared_production_mongodb mongosh \
+            -u "$MONGO_ROOT_USER" \
+            -p "$MONGO_ROOT_PASSWORD" \
+            --authenticationDatabase admin \
+            --eval "
+                db = db.getSiblingDB(process.env.DB_NAME);
+                try { db.dropUser(process.env.APP_DB_USER); } catch (e) {}
+                try { db.dropDatabase(); } catch (e) {}
+            " >/dev/null
+    fi
+
     # --- Pre-Flight Contract Verification ---
     log_info "1. Pulling container image to inspect contract: ${IMAGE}..."
     podman pull "$IMAGE" >/dev/null
 
-    log_info "2. Inspecting application contract via --show-spec..."
-    ENTRYPOINT_JSON=$(podman image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}' 2>/dev/null || echo "null")
-    IS_WRAPPER=$(echo "$ENTRYPOINT_JSON" | jq -e 'type == "array" and (.[0] | sub(".*/"; "") | in({"npm":1, "yarn":1, "pnpm":1, "bun":1}))' >/dev/null 2>&1 && echo "true" || echo "false")
-    SPEC_ERR_FILE=$(mktemp)
-    if [ "$IS_WRAPPER" = "true" ]; then
-        log_info "Package manager entrypoint wrapper detected. Injecting '--' before contract flags."
-        SPEC_OUTPUT=$(podman run --rm "$IMAGE" -- --show-spec 2>"$SPEC_ERR_FILE" || true)
-    else
-        SPEC_OUTPUT=$(podman run --rm "$IMAGE" --show-spec 2>"$SPEC_ERR_FILE" || true)
-    fi
-    
-    if ! echo "$SPEC_OUTPUT" | grep -q "^REQUIRED_PARAMETERS="; then
-        log_error "Application contract validation failed: Image does not support --show-spec or is invalid."
-        if [ -s "$SPEC_ERR_FILE" ]; then
-            log_error "Container error output:"
-            cat "$SPEC_ERR_FILE" >&2
-        fi
-        rm -f "$SPEC_ERR_FILE"
-        exit 1
-    fi
-    rm -f "$SPEC_ERR_FILE"
+    log_info "2. Inspecting application contract..."
+    SPEC_OUTPUT=$(verify_container_contract "$IMAGE" "Application contract validation failed: Image does not support --show-spec or is invalid.")
 
-    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
-    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
+    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2- | tr -d '\r' | tr -d '[:space:]')
+    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2- | tr -d '\r' | tr -d '[:space:]')
 
-    # Validate required parameters
+    # Merge/Clear Parameters & Limits
+    declare -A MERGED_PARAMS
+    ACTIVE_CPUS=""
+    ACTIVE_MEM=""
+
+    if [ "$parameters_exist" = true ] && [ "$USE_EXISTING_PARAMS" = true ] && [ -f "$APP_DIR/.env.production" ]; then
+        log_info "Reusing existing parameters..."
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=$(echo "$line" | tr -d '\r')
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            if [[ "$line" != *=* ]]; then continue; fi
+            
+            KEY="${line%%=*}"
+            VAL="${line#*=}"
+            # Trim leading/trailing whitespace
+            KEY="${KEY#"${KEY%%[![:space:]]*}"}"
+            KEY="${KEY%"${KEY##*[![:space:]]}"}"
+            VAL="${VAL#"${VAL%%[![:space:]]*}"}"
+            VAL="${VAL%"${VAL##*[![:space:]]}"}"
+            
+            if [ "$KEY" != "PORT" ] && [ "$KEY" != "APP_ENV" ] && [ "$KEY" != "APP_DOMAIN" ] && [ "$KEY" != "APP_CPUS" ] && [ "$KEY" != "APP_MEM_LIMIT" ]; then
+                MERGED_PARAMS["$KEY"]="$VAL"
+            fi
+        done < "$APP_DIR/.env.production"
+
+        set +e
+        ENV_CPUS=$(grep "^APP_CPUS=" "$APP_DIR/.env.production" | cut -d= -f2-)
+        ENV_MEM=$(grep "^APP_MEM_LIMIT=" "$APP_DIR/.env.production" | cut -d= -f2-)
+        set -e
+        if [ -n "$ENV_CPUS" ]; then ACTIVE_CPUS="$ENV_CPUS"; fi
+        if [ -n "$ENV_MEM" ]; then ACTIVE_MEM="$ENV_MEM"; fi
+    fi
+
+    # Add new CLI parameter inputs
+    for param in "${APP_PARAMS[@]}"; do
+        KEY="${param%%=*}"
+        VAL="${param#*=}"
+        MERGED_PARAMS["$KEY"]="$VAL"
+    done
+
+    if [ -n "$APP_CPU" ]; then
+        ACTIVE_CPUS="$APP_CPU"
+    fi
+    if [ -n "$APP_MEM" ]; then
+        ACTIVE_MEM="$APP_MEM"
+    fi
+
+    # Merge/Clear Secrets
+    declare -A MAPPED_SECRETS
+    if [ "$secrets_exist" = true ] && [ "$USE_EXISTING_SECRETS" = true ] && [ -f "$APP_DIR/docker-compose.prod.yml" ]; then
+        log_info "Reusing existing custom secrets mappings..."
+        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9._-]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
+            KEY="${s_source#${APP_NAME}_secret_}"
+            MAPPED_SECRETS["$KEY"]="$s_source"
+        done
+    fi
+
+    # Register and map new app-specific secrets
+    for secret in "${APP_SECRETS[@]}"; do
+        KEY="${secret%%=*}"
+        VAL="${secret#*=}"
+        SECRET_NAME="${APP_NAME}_secret_${KEY}"
+        
+        log_info "Registering secret '$KEY' in Podman..."
+        podman secret rm "$SECRET_NAME" >/dev/null 2>&1 || true
+        printf "%s" "$VAL" | podman secret create "$SECRET_NAME" -
+        MAPPED_SECRETS["$KEY"]="$SECRET_NAME"
+    done
+
+    # Validate parameters
     IFS=',' read -ra REQ_PARAMS <<< "$REQ_PARAMS_STR"
     MISSING_PARAMS=()
     for req in "${REQ_PARAMS[@]}"; do
         [ -z "$req" ] && continue
-        FOUND=false
-        for param in "${APP_PARAMS[@]}"; do
-            KEY="${param%%=*}"
-            if [ "$KEY" = "$req" ]; then
-                FOUND=true
-                break
-            fi
-        done
-        if [ "$FOUND" = false ]; then
+        if [[ "$req" =~ ^(PORT|APP_ENV|APP_DOMAIN)$ ]]; then
+            continue
+        fi
+        if [ -z "${MERGED_PARAMS[$req]}" ]; then
             MISSING_PARAMS+=("$req")
         fi
     done
 
-    # Validate required secrets
+    # Validate secrets
     IFS=',' read -ra REQ_SECRETS <<< "$REQ_SECRETS_STR"
     MISSING_SECRETS=()
     for req in "${REQ_SECRETS[@]}"; do
         [ -z "$req" ] && continue
-        FOUND=false
-        for secret in "${APP_SECRETS[@]}"; do
-            KEY="${secret%%=*}"
-            if [ "$KEY" = "$req" ]; then
-                FOUND=true
-                break
-            fi
-        done
-        if [ "$FOUND" = false ]; then
+        if [ "$req" = "MONGO_URI" ]; then
+            continue
+        fi
+        SECRET_NAME="${MAPPED_SECRETS[$req]}"
+        if [ -z "$SECRET_NAME" ] && podman secret inspect "${APP_NAME}_secret_${req}" >/dev/null 2>&1; then
+            SECRET_NAME="${APP_NAME}_secret_${req}"
+            MAPPED_SECRETS["$req"]="$SECRET_NAME"
+        fi
+        if [ -z "$SECRET_NAME" ] || ! podman secret inspect "$SECRET_NAME" >/dev/null 2>&1; then
             MISSING_SECRETS+=("$req")
         fi
     done
@@ -665,13 +1416,13 @@ do_create_app() {
     if [ ${#MISSING_PARAMS[@]} -gt 0 ] || [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
         log_error "Pre-flight contract verification failed! Missing mandatory configurations."
         if [ ${#MISSING_PARAMS[@]} -gt 0 ]; then
-            echo -e "${RED}Missing required parameters (pass via --app-parameter):${NC}"
+            echo -e "${RED}Missing required parameters:${NC}"
             for m in "${MISSING_PARAMS[@]}"; do
                 echo -e "  - $m"
             done
         fi
         if [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
-            echo -e "${RED}Missing required secrets (pass via --app-secret):${NC}"
+            echo -e "${RED}Missing required secrets:${NC}"
             for s in "${MISSING_SECRETS[@]}"; do
                 echo -e "  - $s"
             done
@@ -689,51 +1440,68 @@ do_create_app() {
     echo -e "  Domain:     ${YELLOW}${APP_DOMAIN}${NC}"
     echo ""
 
-    # Generate unique scoped DB credentials
-    APP_DB_USER="user_$(echo "$APP_NAME" | tr '-' '_' | tr '.' '_')"
-    APP_DB_PASSWORD=$(openssl rand -hex 16 2>/dev/null || gpg --gen-random --armor 1 16 2>/dev/null || dd if=/dev/urandom bs=1 count=16 2>/dev/null | od -An -vtx1 | tr -d ' \n' || echo "AppPass$(date +%s%N)")
-    SCOPED_MONGO_URI="mongodb://${APP_DB_USER}:${APP_DB_PASSWORD}@shared_production_mongodb:27017/${DB_NAME}?authSource=admin"
+    # Generate unique scoped DB credentials or retrieve existing ones
+    APP_DB_PASSWORD=""
+    SCOPED_MONGO_URI=""
 
-    # Create user in MongoDB
+    if [ "$secrets_exist" = true ] && [ "$USE_EXISTING_SECRETS" = true ]; then
+        log_info "Reading connection URI from existing Podman secret..."
+        # Retrieve existing URI using busybox, alpine, or user image
+        SCOPED_MONGO_URI=$(timeout 10 podman run --rm --entrypoint "" --secret "${APP_NAME}_mongo_uri" mongo:7.0 cat "/run/secrets/${APP_NAME}_mongo_uri" 2>/dev/null || \
+                           timeout 10 podman run --rm --entrypoint "" --secret "${APP_NAME}_mongo_uri" "${IMAGE}" cat "/run/secrets/${APP_NAME}_mongo_uri" 2>/dev/null || \
+                           timeout 10 podman run --rm --entrypoint "" --secret "${APP_NAME}_mongo_uri" docker.io/library/busybox:latest cat "/run/secrets/${APP_NAME}_mongo_uri" 2>/dev/null || \
+                           timeout 10 podman run --rm --entrypoint "" --secret "${APP_NAME}_mongo_uri" docker.io/library/alpine:latest cat "/run/secrets/${APP_NAME}_mongo_uri" 2>/dev/null || true)
+        
+        if [ -z "$SCOPED_MONGO_URI" ]; then
+            log_error "Failed to retrieve connection URI from existing Podman secret '${APP_NAME}_mongo_uri'."
+            exit 1
+        fi
+        
+        # Extract user and password from connection URI
+        local uri_no_proto="${SCOPED_MONGO_URI#mongodb://}"
+        local credentials="${uri_no_proto%%@*}"
+        APP_DB_USER="${credentials%%:*}"
+        APP_DB_PASSWORD="${credentials#*:}"
+    else
+        APP_DB_PASSWORD=$(openssl rand -hex 16 2>/dev/null || gpg --gen-random --armor 1 16 2>/dev/null || dd if=/dev/urandom bs=1 count=16 2>/dev/null | od -An -vtx1 | tr -d ' \n' || echo "AppPass$(date +%s%N)")
+        SCOPED_MONGO_URI="mongodb://${APP_DB_USER}:${APP_DB_PASSWORD}@shared_production_mongodb:27017/${DB_NAME}?authSource=${DB_NAME}"
+    fi
+
+    # Create/update user in MongoDB
     if ! podman ps --format "{{.Names}}" | grep -q "^shared_production_mongodb$"; then
         log_error "MongoDB container 'shared_production_mongodb' is not running. Start infrastructure first."
         exit 1
     fi
 
-    log_info "Provisioning isolated database user '${APP_DB_USER}'..."
-    podman exec -i shared_production_mongodb mongosh \
+    verify_mongodb_ready
+
+    log_info "Provisioning/updating isolated database user '${APP_DB_USER}'..."
+    podman exec -i \
+        -e DB_NAME="${DB_NAME}" \
+        -e APP_DB_USER="${APP_DB_USER}" \
+        -e APP_DB_PASSWORD="${APP_DB_PASSWORD}" \
+        shared_production_mongodb mongosh \
         -u "$MONGO_ROOT_USER" \
         -p "$MONGO_ROOT_PASSWORD" \
         --authenticationDatabase admin \
         --eval "
-            db = db.getSiblingDB('${DB_NAME}');
-            if (!db.getUser('${APP_DB_USER}')) {
+            db = db.getSiblingDB(process.env.DB_NAME);
+            const dbUser = process.env.APP_DB_USER;
+            const dbPassword = process.env.APP_DB_PASSWORD;
+            if (!db.getUser(dbUser)) {
                 db.createUser({
-                    user: '${APP_DB_USER}',
-                    pwd: '${APP_DB_PASSWORD}',
-                    roles: [{ role: 'readWrite', db: '${DB_NAME}' }]
+                    user: dbUser,
+                    pwd: dbPassword,
+                    roles: [{ role: 'readWrite', db: process.env.DB_NAME }]
                 });
             } else {
-                db.changeUserPassword('${APP_DB_USER}', '${APP_DB_PASSWORD}');
+                db.changeUserPassword(dbUser, dbPassword);
             }
         " >/dev/null
 
     log_info "Storing database connection string as a Podman Secret..."
     podman secret rm "${APP_NAME}_mongo_uri" >/dev/null 2>&1 || true
-    echo -n "$SCOPED_MONGO_URI" | podman secret create "${APP_NAME}_mongo_uri" -
-
-    # Register application secrets
-    if [ ${#APP_SECRETS[@]} -gt 0 ]; then
-        log_info "Registering application secrets with Podman..."
-        for secret in "${APP_SECRETS[@]}"; do
-            KEY="${secret%%=*}"
-            VAL="${secret#*=}"
-            SECRET_NAME="${APP_NAME}_secret_${KEY}"
-            
-            podman secret rm "$SECRET_NAME" >/dev/null 2>&1 || true
-            echo -n "$VAL" | podman secret create "$SECRET_NAME" -
-        done
-    fi
+    printf "%s" "$SCOPED_MONGO_URI" | podman secret create "${APP_NAME}_mongo_uri" -
 
     # Create directory and assign permissions to current user
     sudo mkdir -p "$APP_DIR"
@@ -742,23 +1510,23 @@ do_create_app() {
     # Write .env.production
     cat <<EOF > "$APP_DIR/.env.production"
 PORT=3000
-NODE_ENV=production
+APP_ENV=production
 APP_DOMAIN=${APP_DOMAIN}
 EOF
 
-    if [ -n "$APP_CPU" ]; then
-        echo "APP_CPUS=${APP_CPU}" >> "$APP_DIR/.env.production"
+    if [ -n "$ACTIVE_CPUS" ]; then
+        echo "APP_CPUS=${ACTIVE_CPUS}" >> "$APP_DIR/.env.production"
     fi
-    if [ -n "$APP_MEM" ]; then
-        echo "APP_MEM_LIMIT=${APP_MEM}" >> "$APP_DIR/.env.production"
+    if [ -n "$ACTIVE_MEM" ]; then
+        echo "APP_MEM_LIMIT=${ACTIVE_MEM}" >> "$APP_DIR/.env.production"
     fi
 
     # Write any app-specific parameters
-    if [ ${#APP_PARAMS[@]} -gt 0 ]; then
+    if [ ${#MERGED_PARAMS[@]} -gt 0 ]; then
         echo "" >> "$APP_DIR/.env.production"
         echo "# App-specific parameters" >> "$APP_DIR/.env.production"
-        for param in "${APP_PARAMS[@]}"; do
-            echo "$param" >> "$APP_DIR/.env.production"
+        for key in "${!MERGED_PARAMS[@]}"; do
+            echo "$key=${MERGED_PARAMS[$key]}" >> "$APP_DIR/.env.production"
         done
     fi
     chmod 600 "$APP_DIR/.env.production"
@@ -767,18 +1535,18 @@ EOF
     SERVICES_SECRETS_SECTION="    secrets:\n      - source: ${APP_NAME}_mongo_uri\n        target: MONGO_URI"
     GLOBAL_SECRETS_SECTION="secrets:\n  ${APP_NAME}_mongo_uri:\n    external: true"
 
-    if [ ${#APP_SECRETS[@]} -gt 0 ]; then
-        for secret in "${APP_SECRETS[@]}"; do
-            KEY="${secret%%=*}"
-            SERVICES_SECRETS_SECTION="${SERVICES_SECRETS_SECTION}\n      - source: ${APP_NAME}_secret_${KEY}\n        target: ${KEY}"
-            GLOBAL_SECRETS_SECTION="${GLOBAL_SECRETS_SECTION}\n  ${APP_NAME}_secret_${KEY}:\n    external: true"
-        done
-    fi
+    for key in "${!MAPPED_SECRETS[@]}"; do
+        SECRET_NAME="${MAPPED_SECRETS[$key]}"
+        SERVICES_SECRETS_SECTION="${SERVICES_SECRETS_SECTION}\n      - source: ${SECRET_NAME}\n        target: ${key}"
+        GLOBAL_SECRETS_SECTION="${GLOBAL_SECRETS_SECTION}\n  ${SECRET_NAME}:\n    external: true"
+    done
 
     # Write docker-compose.prod.yml
     COMPOSE_FILE="$APP_DIR/docker-compose.prod.yml"
     cat <<EOF > "$COMPOSE_FILE"
-version: "3.8"
+# WARNING: THIS FILE IS AUTOGENERATED BY appRouter.sh
+# ANY MANUAL CHANGES MADE TO THIS FILE WILL BE OVERWRITTEN
+# DURING RECONFIGURATIONS, UPDATES, OR REDEPLOYMENTS.
 
 services:
   backend-${APP_NAME}:
@@ -796,23 +1564,24 @@ services:
         max-file: "3"
 EOF
 
-    if [ -n "$APP_CPU" ]; then
-        echo "    cpus: \"${APP_CPU}\"" >> "$COMPOSE_FILE"
+    if [ -n "$ACTIVE_CPUS" ]; then
+        echo "    cpus: \"${ACTIVE_CPUS}\"" >> "$COMPOSE_FILE"
     fi
-    if [ -n "$APP_MEM" ]; then
-        echo "    mem_limit: \"${APP_MEM}\"" >> "$COMPOSE_FILE"
+    if [ -n "$ACTIVE_MEM" ]; then
+        echo "    mem_limit: \"${ACTIVE_MEM}\"" >> "$COMPOSE_FILE"
     fi
 
     # Append mounted secrets
-    echo -e "$SERVICES_SECRETS_SECTION" >> "$COMPOSE_FILE"
+    printf "%b\n" "$SERVICES_SECRETS_SECTION" >> "$COMPOSE_FILE"
 
     # Append Traefik routing labels
     cat <<EOF >> "$COMPOSE_FILE"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.${APP_NAME}.rule=PathPrefix(\`/${APP_NAME}\`)"
+      - "traefik.http.routers.${APP_NAME}.rule=Host(\`${APP_DOMAIN}\`) && PathPrefix(\`/${APP_NAME}\`)"
       - "traefik.http.routers.${APP_NAME}.entrypoints=websecure"
       - "traefik.http.routers.${APP_NAME}.tls=true"
+      - "traefik.http.routers.${APP_NAME}.tls.certresolver=letsencryptresolver"
       - "traefik.http.middlewares.${APP_NAME}-strip.stripprefix.prefixes=/${APP_NAME}"
       - "traefik.http.routers.${APP_NAME}.middlewares=${APP_NAME}-strip"
       - "traefik.http.services.${APP_NAME}.loadbalancer.server.port=3000"
@@ -820,7 +1589,7 @@ EOF
 EOF
 
     # Append global secrets definition
-    echo -e "$GLOBAL_SECRETS_SECTION" >> "$COMPOSE_FILE"
+    printf "%b\n" "$GLOBAL_SECRETS_SECTION" >> "$COMPOSE_FILE"
 
     # Append networks
     cat <<EOF >> "$COMPOSE_FILE"
@@ -841,9 +1610,7 @@ EOF
 do_list() {
     log_info "Scanning for deployed applications under /opt/..."
     
-    printf "\n%-20s %-50s %-20s\n" "Application" "Route URL" "Container Status"
-    printf "%-20s %-50s %-20s\n" "-----------" "---------" "----------------"
-
+    local app_count=0
     for dir in /opt/*; do
         [ -d "$dir" ] || continue
         APP_DIR_NAME=$(basename "$dir")
@@ -851,29 +1618,41 @@ do_list() {
         
         COMPOSE_PATH="$dir/docker-compose.prod.yml"
         if [ -f "$COMPOSE_PATH" ]; then
+            if [ $app_count -eq 0 ]; then
+                printf "\n%-30s %-60s %-35s\n" "Application" "Route URL" "Container Status"
+                printf "%-30s %-60s %-35s\n" "-----------" "---------" "----------------"
+            fi
+            
             ENV_PATH="$dir/.env.production"
             DOMAIN="unknown-domain"
             if [ -f "$ENV_PATH" ]; then
-                DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_PATH" | cut -d= -f2 | tr -d '\r')
+                DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_PATH" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
             fi
             
             ROUTE_URL="https://${DOMAIN}/${APP_DIR_NAME}"
             CONTAINER_NAME="app_${APP_DIR_NAME}_backend"
-            STATUS=$(podman ps -a --filter "name=${CONTAINER_NAME}" --format "{{.Status}}" 2>/dev/null)
+            STATUS=$(podman ps -a --filter "name=^${CONTAINER_NAME}$" --format "{{.Status}}" 2>/dev/null)
             
             if [ -z "$STATUS" ]; then
                 STATUS="Not Found / Stopped"
             fi
             
-            printf "%-20s %-50s %-20s\n" "$APP_DIR_NAME" "$ROUTE_URL" "$STATUS"
+            printf "%-30s %-60s %-35s\n" "$APP_DIR_NAME" "$ROUTE_URL" "$STATUS"
+            app_count=$((app_count + 1))
         fi
     done
-    echo ""
+    
+    if [ $app_count -eq 0 ]; then
+        log_info "No deployed applications found."
+    else
+        echo ""
+    fi
 }
 
 do_start() {
-    APP_NAME=$(echo "$1" | tr '.' '-')
-    APP_DIR="/opt/$APP_NAME"
+    local APP_NAME
+    APP_NAME=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+    local APP_DIR="/opt/$APP_NAME"
     if [ ! -d "$APP_DIR" ] || [ ! -f "$APP_DIR/docker-compose.prod.yml" ]; then
         log_error "Application '$APP_NAME' is not deployed or missing docker-compose.prod.yml."
         exit 1
@@ -885,8 +1664,9 @@ do_start() {
 }
 
 do_stop() {
-    APP_NAME=$(echo "$1" | tr '.' '-')
-    APP_DIR="/opt/$APP_NAME"
+    local APP_NAME
+    APP_NAME=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+    local APP_DIR="/opt/$APP_NAME"
     if [ ! -d "$APP_DIR" ] || [ ! -f "$APP_DIR/docker-compose.prod.yml" ]; then
         log_error "Application '$APP_NAME' is not deployed or missing docker-compose.prod.yml."
         exit 1
@@ -898,22 +1678,25 @@ do_stop() {
 }
 
 do_restart() {
-    APP_NAME=$(echo "$1" | tr '.' '-')
-    APP_DIR="/opt/$APP_NAME"
+    local APP_NAME
+    APP_NAME=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+    local APP_DIR="/opt/$APP_NAME"
     if [ ! -d "$APP_DIR" ] || [ ! -f "$APP_DIR/docker-compose.prod.yml" ]; then
         log_error "Application '$APP_NAME' is not deployed or missing docker-compose.prod.yml."
         exit 1
     fi
-    log_info "Restarting application '$APP_NAME'..."
+    log_info "Restarting application '$APP_NAME' (recreating containers to apply configuration updates)..."
     cd "$APP_DIR"
-    podman-compose -f docker-compose.prod.yml restart
+    podman-compose -f docker-compose.prod.yml down
+    podman-compose -f docker-compose.prod.yml up -d
     log_success "Application '$APP_NAME' restarted."
 }
 
 do_logs() {
-    APP_NAME=$(echo "$1" | tr '.' '-')
+    local APP_NAME
+    APP_NAME=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
     shift
-    APP_DIR="/opt/$APP_NAME"
+    local APP_DIR="/opt/$APP_NAME"
     if [ ! -d "$APP_DIR" ] || [ ! -f "$APP_DIR/docker-compose.prod.yml" ]; then
         log_error "Application '$APP_NAME' is not deployed or missing docker-compose.prod.yml."
         exit 1
@@ -923,7 +1706,8 @@ do_logs() {
 }
 
 do_configure() {
-    APP_NAME=$(echo "$1" | tr '.' '-')
+    local APP_NAME APP_DIR ENV_FILE APP_DOMAIN IMAGE
+    APP_NAME=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
     APP_DIR="/opt/$APP_NAME"
     ENV_FILE="$INFRA_DIR/.env"
     
@@ -938,7 +1722,7 @@ do_configure() {
         exit 1
     fi
     set +e
-    APP_DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
+    APP_DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
     set -e
     if [ -z "$APP_DOMAIN" ]; then
         log_error "Failed to retrieve APP_DOMAIN from $ENV_FILE."
@@ -946,6 +1730,7 @@ do_configure() {
     fi
 
     IMAGE=$(grep "image:" "$APP_DIR/docker-compose.prod.yml" | head -n 1 | awk '{print $2}')
+    IMAGE=$(echo "$IMAGE" | tr -d '"'\')
     if [ -z "$IMAGE" ]; then
         log_error "Could not resolve image for application '$APP_NAME' from existing compose file."
         exit 1
@@ -965,7 +1750,13 @@ do_configure() {
             
             KEY="${line%%=*}"
             VAL="${line#*=}"
-            if [ "$KEY" != "PORT" ] && [ "$KEY" != "NODE_ENV" ] && [ "$KEY" != "APP_DOMAIN" ] && [ "$KEY" != "APP_CPUS" ] && [ "$KEY" != "APP_MEM_LIMIT" ]; then
+            # Trim leading/trailing whitespace
+            KEY="${KEY#"${KEY%%[![:space:]]*}"}"
+            KEY="${KEY%"${KEY##*[![:space:]]}"}"
+            VAL="${VAL#"${VAL%%[![:space:]]*}"}"
+            VAL="${VAL%"${VAL##*[![:space:]]}"}"
+            
+            if [ "$KEY" != "PORT" ] && [ "$KEY" != "APP_ENV" ] && [ "$KEY" != "APP_DOMAIN" ] && [ "$KEY" != "APP_CPUS" ] && [ "$KEY" != "APP_MEM_LIMIT" ]; then
                 MERGED_PARAMS["$KEY"]="$VAL"
             fi
         done < "$APP_DIR/.env.production"
@@ -973,8 +1764,8 @@ do_configure() {
 
     if [ "$CLEAR_LIMITS" = false ] && [ -f "$APP_DIR/.env.production" ]; then
         set +e
-        ENV_CPUS=$(grep "^APP_CPUS=" "$APP_DIR/.env.production" | cut -d= -f2)
-        ENV_MEM=$(grep "^APP_MEM_LIMIT=" "$APP_DIR/.env.production" | cut -d= -f2)
+        ENV_CPUS=$(grep "^APP_CPUS=" "$APP_DIR/.env.production" | cut -d= -f2-)
+        ENV_MEM=$(grep "^APP_MEM_LIMIT=" "$APP_DIR/.env.production" | cut -d= -f2-)
         set -e
         if [ -n "$ENV_CPUS" ]; then ACTIVE_CPUS="$ENV_CPUS"; fi
         if [ -n "$ENV_MEM" ]; then ACTIVE_MEM="$ENV_MEM"; fi
@@ -996,7 +1787,7 @@ do_configure() {
     # Merge/Clear Secrets
     declare -A MAPPED_SECRETS
     if [ "$CLEAR_SECRETS" = false ] && [ -f "$APP_DIR/docker-compose.prod.yml" ]; then
-        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9_]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
+        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9._-]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
             KEY="${s_source#${APP_NAME}_secret_}"
             MAPPED_SECRETS["$KEY"]="$s_source"
         done
@@ -1016,41 +1807,24 @@ do_configure() {
         
         log_info "Registering secret '$KEY' in Podman..."
         podman secret rm "$SECRET_NAME" >/dev/null 2>&1 || true
-        echo -n "$VAL" | podman secret create "$SECRET_NAME" -
+        printf "%s" "$VAL" | podman secret create "$SECRET_NAME" -
         MAPPED_SECRETS["$KEY"]="$SECRET_NAME"
     done
 
     # Pre-Flight Contract Verification
-    log_info "Inspecting application contract via --show-spec..."
-    ENTRYPOINT_JSON=$(podman image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}' 2>/dev/null || echo "null")
-    IS_WRAPPER=$(echo "$ENTRYPOINT_JSON" | jq -e 'type == "array" and (.[0] | sub(".*/"; "") | in({"npm":1, "yarn":1, "pnpm":1, "bun":1}))' >/dev/null 2>&1 && echo "true" || echo "false")
-    SPEC_ERR_FILE=$(mktemp)
-    if [ "$IS_WRAPPER" = "true" ]; then
-        log_info "Package manager entrypoint wrapper detected. Injecting '--' before contract flags."
-        SPEC_OUTPUT=$(podman run --rm "$IMAGE" -- --show-spec 2>"$SPEC_ERR_FILE" || true)
-    else
-        SPEC_OUTPUT=$(podman run --rm "$IMAGE" --show-spec 2>"$SPEC_ERR_FILE" || true)
-    fi
-    
-    if ! echo "$SPEC_OUTPUT" | grep -q "^REQUIRED_PARAMETERS="; then
-        log_error "Application contract validation failed: Image does not support --show-spec or is invalid."
-        if [ -s "$SPEC_ERR_FILE" ]; then
-            log_error "Container error output:"
-            cat "$SPEC_ERR_FILE" >&2
-        fi
-        rm -f "$SPEC_ERR_FILE"
-        exit 1
-    fi
-    rm -f "$SPEC_ERR_FILE"
+    SPEC_OUTPUT=$(verify_container_contract "$IMAGE" "Application contract validation failed: Image does not support --show-spec or is invalid.")
 
-    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
-    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
+    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2- | tr -d '\r' | tr -d '[:space:]')
+    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2- | tr -d '\r' | tr -d '[:space:]')
 
     # Validate parameters
     IFS=',' read -ra REQ_PARAMS <<< "$REQ_PARAMS_STR"
     MISSING_PARAMS=()
     for req in "${REQ_PARAMS[@]}"; do
         [ -z "$req" ] && continue
+        if [[ "$req" =~ ^(PORT|APP_ENV|APP_DOMAIN)$ ]]; then
+            continue
+        fi
         if [ -z "${MERGED_PARAMS[$req]}" ]; then
             MISSING_PARAMS+=("$req")
         fi
@@ -1061,7 +1835,15 @@ do_configure() {
     MISSING_SECRETS=()
     for req in "${REQ_SECRETS[@]}"; do
         [ -z "$req" ] && continue
-        if [ -z "${MAPPED_SECRETS[$req]}" ]; then
+        if [ "$req" = "MONGO_URI" ]; then
+            continue
+        fi
+        SECRET_NAME="${MAPPED_SECRETS[$req]}"
+        if [ -z "$SECRET_NAME" ] && podman secret inspect "${APP_NAME}_secret_${req}" >/dev/null 2>&1; then
+            SECRET_NAME="${APP_NAME}_secret_${req}"
+            MAPPED_SECRETS["$req"]="$SECRET_NAME"
+        fi
+        if [ -z "$SECRET_NAME" ] || ! podman secret inspect "$SECRET_NAME" >/dev/null 2>&1; then
             MISSING_SECRETS+=("$req")
         fi
     done
@@ -1088,7 +1870,7 @@ do_configure() {
     # Write .env.production
     cat <<EOF > "$APP_DIR/.env.production"
 PORT=3000
-NODE_ENV=production
+APP_ENV=production
 APP_DOMAIN=${APP_DOMAIN}
 EOF
 
@@ -1121,7 +1903,9 @@ EOF
     # Write docker-compose.prod.yml
     COMPOSE_FILE="$APP_DIR/docker-compose.prod.yml"
     cat <<EOF > "$COMPOSE_FILE"
-version: "3.8"
+# WARNING: THIS FILE IS AUTOGENERATED BY appRouter.sh
+# ANY MANUAL CHANGES MADE TO THIS FILE WILL BE OVERWRITTEN
+# DURING RECONFIGURATIONS, UPDATES, OR REDEPLOYMENTS.
 
 services:
   backend-${APP_NAME}:
@@ -1146,21 +1930,22 @@ EOF
         echo "    mem_limit: \"${ACTIVE_MEM}\"" >> "$COMPOSE_FILE"
     fi
 
-    echo -e "$SERVICES_SECRETS_SECTION" >> "$COMPOSE_FILE"
+    printf "%b\n" "$SERVICES_SECRETS_SECTION" >> "$COMPOSE_FILE"
 
     cat <<EOF >> "$COMPOSE_FILE"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.${APP_NAME}.rule=PathPrefix(\`/${APP_NAME}\`)"
+      - "traefik.http.routers.${APP_NAME}.rule=Host(\`${APP_DOMAIN}\`) && PathPrefix(\`/${APP_NAME}\`)"
       - "traefik.http.routers.${APP_NAME}.entrypoints=websecure"
       - "traefik.http.routers.${APP_NAME}.tls=true"
+      - "traefik.http.routers.${APP_NAME}.tls.certresolver=letsencryptresolver"
       - "traefik.http.middlewares.${APP_NAME}-strip.stripprefix.prefixes=/${APP_NAME}"
       - "traefik.http.routers.${APP_NAME}.middlewares=${APP_NAME}-strip"
       - "traefik.http.services.${APP_NAME}.loadbalancer.server.port=3000"
 
 EOF
 
-    echo -e "$GLOBAL_SECRETS_SECTION" >> "$COMPOSE_FILE"
+    printf "%b\n" "$GLOBAL_SECRETS_SECTION" >> "$COMPOSE_FILE"
 
     cat <<EOF >> "$COMPOSE_FILE"
 
@@ -1174,13 +1959,27 @@ EOF
 }
 
 do_update() {
-    APP_NAME=$(echo "$1" | tr '.' '-')
+    local APP_NAME NEW_IMAGE APP_DIR ENV_FILE IMAGE
+    APP_NAME=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
     NEW_IMAGE="$2"
     APP_DIR="/opt/$APP_NAME"
     ENV_FILE="$INFRA_DIR/.env"
     
     if [ ! -d "$APP_DIR" ] || [ ! -f "$APP_DIR/docker-compose.prod.yml" ]; then
         log_error "Application '$APP_NAME' is not deployed or missing docker-compose.prod.yml."
+        exit 1
+    fi
+
+    # Read APP_DOMAIN from central .env
+    if [ ! -f "$ENV_FILE" ]; then
+        log_error "Central infrastructure is not installed or .env is missing. Run install first."
+        exit 1
+    fi
+    set +e
+    APP_DOMAIN=$(grep "^APP_DOMAIN=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    set -e
+    if [ -z "$APP_DOMAIN" ]; then
+        log_error "Failed to retrieve APP_DOMAIN from $ENV_FILE."
         exit 1
     fi
     
@@ -1190,6 +1989,7 @@ do_update() {
     else
         IMAGE=$(grep "image:" "$APP_DIR/docker-compose.prod.yml" | head -n 1 | awk '{print $2}')
     fi
+    IMAGE=$(echo "$IMAGE" | tr -d '"'\')
     
     log_info "1. Pulling updated image: $IMAGE..."
     podman pull "$IMAGE" >/dev/null
@@ -1208,14 +2008,20 @@ do_update() {
             
             KEY="${line%%=*}"
             VAL="${line#*=}"
-            if [ "$KEY" != "PORT" ] && [ "$KEY" != "NODE_ENV" ] && [ "$KEY" != "APP_DOMAIN" ] && [ "$KEY" != "APP_CPUS" ] && [ "$KEY" != "APP_MEM_LIMIT" ]; then
+            # Trim leading/trailing whitespace
+            KEY="${KEY#"${KEY%%[![:space:]]*}"}"
+            KEY="${KEY%"${KEY##*[![:space:]]}"}"
+            VAL="${VAL#"${VAL%%[![:space:]]*}"}"
+            VAL="${VAL%"${VAL##*[![:space:]]}"}"
+            
+            if [ "$KEY" != "PORT" ] && [ "$KEY" != "APP_ENV" ] && [ "$KEY" != "APP_DOMAIN" ] && [ "$KEY" != "APP_CPUS" ] && [ "$KEY" != "APP_MEM_LIMIT" ]; then
                 MERGED_PARAMS["$KEY"]="$VAL"
             fi
         done < "$APP_DIR/.env.production"
 
         set +e
-        ENV_CPUS=$(grep "^APP_CPUS=" "$APP_DIR/.env.production" | cut -d= -f2)
-        ENV_MEM=$(grep "^APP_MEM_LIMIT=" "$APP_DIR/.env.production" | cut -d= -f2)
+        ENV_CPUS=$(grep "^APP_CPUS=" "$APP_DIR/.env.production" | cut -d= -f2-)
+        ENV_MEM=$(grep "^APP_MEM_LIMIT=" "$APP_DIR/.env.production" | cut -d= -f2-)
         set -e
         if [ -n "$ENV_CPUS" ]; then ACTIVE_CPUS="$ENV_CPUS"; fi
         if [ -n "$ENV_MEM" ]; then ACTIVE_MEM="$ENV_MEM"; fi
@@ -1223,42 +2029,26 @@ do_update() {
     
     declare -A MAPPED_SECRETS
     if [ -f "$APP_DIR/docker-compose.prod.yml" ]; then
-        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9_]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
+        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9._-]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
             KEY="${s_source#${APP_NAME}_secret_}"
             MAPPED_SECRETS["$KEY"]="$s_source"
         done
     fi
     
-    log_info "2. Inspecting contract of new image via --show-spec..."
-    ENTRYPOINT_JSON=$(podman image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}' 2>/dev/null || echo "null")
-    IS_WRAPPER=$(echo "$ENTRYPOINT_JSON" | jq -e 'type == "array" and (.[0] | sub(".*/"; "") | in({"npm":1, "yarn":1, "pnpm":1, "bun":1}))' >/dev/null 2>&1 && echo "true" || echo "false")
-    SPEC_ERR_FILE=$(mktemp)
-    if [ "$IS_WRAPPER" = "true" ]; then
-        log_info "Package manager entrypoint wrapper detected. Injecting '--' before contract flags."
-        SPEC_OUTPUT=$(podman run --rm "$IMAGE" -- --show-spec 2>"$SPEC_ERR_FILE" || true)
-    else
-        SPEC_OUTPUT=$(podman run --rm "$IMAGE" --show-spec 2>"$SPEC_ERR_FILE" || true)
-    fi
-    
-    if ! echo "$SPEC_OUTPUT" | grep -q "^REQUIRED_PARAMETERS="; then
-        log_error "Application contract validation failed: Updated image does not support --show-spec or is invalid."
-        if [ -s "$SPEC_ERR_FILE" ]; then
-            log_error "Container error output:"
-            cat "$SPEC_ERR_FILE" >&2
-        fi
-        rm -f "$SPEC_ERR_FILE"
-        exit 1
-    fi
-    rm -f "$SPEC_ERR_FILE"
+    log_info "2. Inspecting contract of new image..."
+    SPEC_OUTPUT=$(verify_container_contract "$IMAGE" "Pre-flight contract verification failed for the updated image!")
 
-    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
-    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2 | tr -d '\r' | tr -d '[:space:]')
+    REQ_PARAMS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_PARAMETERS=" | cut -d= -f2- | tr -d '\r' | tr -d '[:space:]')
+    REQ_SECRETS_STR=$(echo "$SPEC_OUTPUT" | grep "^REQUIRED_SECRETS=" | cut -d= -f2- | tr -d '\r' | tr -d '[:space:]')
 
     # Validate parameters
     IFS=',' read -ra REQ_PARAMS <<< "$REQ_PARAMS_STR"
     MISSING_PARAMS=()
     for req in "${REQ_PARAMS[@]}"; do
         [ -z "$req" ] && continue
+        if [[ "$req" =~ ^(PORT|APP_ENV|APP_DOMAIN)$ ]]; then
+            continue
+        fi
         if [ -z "${MERGED_PARAMS[$req]}" ]; then
             MISSING_PARAMS+=("$req")
         fi
@@ -1269,7 +2059,15 @@ do_update() {
     MISSING_SECRETS=()
     for req in "${REQ_SECRETS[@]}"; do
         [ -z "$req" ] && continue
-        if [ -z "${MAPPED_SECRETS[$req]}" ]; then
+        if [ "$req" = "MONGO_URI" ]; then
+            continue
+        fi
+        SECRET_NAME="${MAPPED_SECRETS[$req]}"
+        if [ -z "$SECRET_NAME" ] && podman secret inspect "${APP_NAME}_secret_${req}" >/dev/null 2>&1; then
+            SECRET_NAME="${APP_NAME}_secret_${req}"
+            MAPPED_SECRETS["$req"]="$SECRET_NAME"
+        fi
+        if [ -z "$SECRET_NAME" ] || ! podman secret inspect "$SECRET_NAME" >/dev/null 2>&1; then
             MISSING_SECRETS+=("$req")
         fi
     done
@@ -1305,7 +2103,9 @@ do_update() {
 
     COMPOSE_FILE="$APP_DIR/docker-compose.prod.yml"
     cat <<EOF > "$COMPOSE_FILE"
-version: "3.8"
+# WARNING: THIS FILE IS AUTOGENERATED BY appRouter.sh
+# ANY MANUAL CHANGES MADE TO THIS FILE WILL BE OVERWRITTEN
+# DURING RECONFIGURATIONS, UPDATES, OR REDEPLOYMENTS.
 
 services:
   backend-${APP_NAME}:
@@ -1331,21 +2131,22 @@ EOF
     fi
 
     # Append mounted secrets
-    echo -e "$SERVICES_SECRETS_SECTION" >> "$COMPOSE_FILE"
+    printf "%b\n" "$SERVICES_SECRETS_SECTION" >> "$COMPOSE_FILE"
 
     cat <<EOF >> "$COMPOSE_FILE"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.${APP_NAME}.rule=PathPrefix(\`/${APP_NAME}\`)"
+      - "traefik.http.routers.${APP_NAME}.rule=Host(\`${APP_DOMAIN}\`) && PathPrefix(\`/${APP_NAME}\`)"
       - "traefik.http.routers.${APP_NAME}.entrypoints=websecure"
       - "traefik.http.routers.${APP_NAME}.tls=true"
+      - "traefik.http.routers.${APP_NAME}.tls.certresolver=letsencryptresolver"
       - "traefik.http.middlewares.${APP_NAME}-strip.stripprefix.prefixes=/${APP_NAME}"
       - "traefik.http.routers.${APP_NAME}.middlewares=${APP_NAME}-strip"
       - "traefik.http.services.${APP_NAME}.loadbalancer.server.port=3000"
 
 EOF
 
-    echo -e "$GLOBAL_SECRETS_SECTION" >> "$COMPOSE_FILE"
+    printf "%b\n" "$GLOBAL_SECRETS_SECTION" >> "$COMPOSE_FILE"
 
     cat <<EOF >> "$COMPOSE_FILE"
 
@@ -1363,65 +2164,100 @@ EOF
 }
 
 do_destroy_app() {
-    APP_NAME=$(echo "$1" | tr '.' '-')
-    APP_DIR="/opt/$APP_NAME"
-    ENV_FILE="$INFRA_DIR/.env"
+    local APP_NAME
+    APP_NAME=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+    local APP_DIR="/opt/$APP_NAME"
+    local ENV_FILE="$INFRA_DIR/.env"
+    local MONGO_ROOT_USER
+    local MONGO_ROOT_PASSWORD
+    local APP_DB_USER
+    local DB_NAME
+    
+    # Clean variable scoping with global defaults
+    local local_destroy_secrets="${DESTROY_SECRETS:-keep}"
+    local local_destroy_params="${DESTROY_PARAMS:-keep}"
+    local local_destroy_data="${DESTROY_DATA:-keep}"
+    local local_destroy_backups="${DESTROY_BACKUPS:-keep}"
+    local is_global_uninstall="${GLOBAL_UNINSTALL:-false}"
     
     # 1. Stop container if it is running and workspace exists
     if [ -d "$APP_DIR" ] && [ -f "$APP_DIR/docker-compose.prod.yml" ]; then
         log_info "1. Halting container services for '$APP_NAME'..."
-        cd "$APP_DIR"
-        podman-compose down || true
+        (cd "$APP_DIR" && podman-compose -f docker-compose.prod.yml down) || true
     else
         log_warn "Application directory or compose file not found at $APP_DIR. Skipping service teardown."
     fi
 
     # 2. Handle Secrets cleanup
-    if [ "$DESTROY_SECRETS" = "delete" ]; then
-        log_info "2. Deleting registered secrets from Podman..."
-        podman secret rm "${APP_NAME}_mongo_uri" >/dev/null 2>&1 || true
-        for s in $(podman secret ls --format "{{.Name}}" 2>/dev/null | grep "^${APP_NAME}_secret_"); do
-            podman secret rm "$s" >/dev/null 2>&1 || true
-        done
-        log_success "Secrets deleted."
+    if [ "$local_destroy_secrets" = "delete" ]; then
+        if [ "$is_global_uninstall" = "true" ]; then
+            log_info "2. Bypassing individual secret deletion (handled globally during uninstall)."
+        else
+            log_info "2. Deleting registered secrets from Podman..."
+            podman secret rm "${APP_NAME}_mongo_uri" >/dev/null 2>&1 || true
+            for s in $(podman secret ls --format "{{.Name}}" 2>/dev/null | grep "^${APP_NAME}_secret_"); do
+                podman secret rm "$s" >/dev/null 2>&1 || true
+            done
+            log_success "Secrets deleted."
+        fi
     else
         log_info "2. Preserving registered secrets in Podman."
     fi
 
     # 3. Handle Data cleanup (database drop and user drop)
-    if [ "$DESTROY_DATA" = "delete" ]; then
-        log_info "3. Dropping database and user from MongoDB..."
-        if [ -f "$ENV_FILE" ]; then
-            set +e
-            MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
-            MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
-            set -e
-            
-            if [ -n "$MONGO_ROOT_USER" ] && [ -n "$MONGO_ROOT_PASSWORD" ]; then
-                APP_DB_USER="user_$(echo "$APP_NAME" | tr '-' '_' | tr '.' '_')"
-                DB_NAME=$(echo "$APP_NAME" | tr '-' '_' | tr '.' '_')_db
-                
-                podman exec -i shared_production_mongodb mongosh \
-                    -u "$MONGO_ROOT_USER" \
-                    -p "$MONGO_ROOT_PASSWORD" \
-                    --authenticationDatabase admin \
-                    --eval "
-                        db.getSiblingDB('${DB_NAME}').dropUser('${APP_DB_USER}');
-                        db.getSiblingDB('${DB_NAME}').dropDatabase();
-                    " >/dev/null
-                log_success "Database '${DB_NAME}' and user '${APP_DB_USER}' dropped."
-            else
-                log_error "Could not retrieve root Mongo credentials. Skipping database cleanup."
-            fi
+    if [ "$local_destroy_data" = "delete" ]; then
+        if [ "$is_global_uninstall" = "true" ]; then
+            log_info "3. Bypassing database/user drops (handled globally by volume removal during uninstall)."
         else
-            log_error "Central infrastructure .env not found. Skipping database cleanup."
+            log_info "3. Dropping database and user from MongoDB..."
+            if [ -f "$ENV_FILE" ]; then
+                set +e
+                MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+                MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+                set -e
+                
+                if [ -n "$MONGO_ROOT_USER" ] && [ -n "$MONGO_ROOT_PASSWORD" ]; then
+                    if ! podman ps --format "{{.Names}}" | grep -q "^shared_production_mongodb$"; then
+                        log_warn "MongoDB container 'shared_production_mongodb' is not running. Skipping database cleanup."
+                    else
+                        verify_mongodb_ready
+                        APP_DB_USER="user_$(echo "$APP_NAME" | tr '-' '_' | tr '.' '_')"
+                        DB_NAME=$(echo "$APP_NAME" | tr '-' '_' | tr '.' '_')_db
+                        
+                        set +e
+                        podman exec -i \
+                            -e DB_NAME="${DB_NAME}" \
+                            -e APP_DB_USER="${APP_DB_USER}" \
+                            shared_production_mongodb mongosh \
+                            -u "$MONGO_ROOT_USER" \
+                            -p "$MONGO_ROOT_PASSWORD" \
+                            --authenticationDatabase admin \
+                            --eval "
+                                db = db.getSiblingDB(process.env.DB_NAME);
+                                try { db.dropUser(process.env.APP_DB_USER); } catch (e) {}
+                                try { db.dropDatabase(); } catch (e) {}
+                            " >/dev/null
+                        STATUS=$?
+                        set -e
+                        if [ $STATUS -eq 0 ]; then
+                            log_success "Database '${DB_NAME}' and user '${APP_DB_USER}' dropped."
+                        else
+                            log_warn "Failed to drop database '${DB_NAME}' or user '${APP_DB_USER}' from MongoDB (or container is unreachable)."
+                        fi
+                    fi
+                else
+                    log_error "Could not retrieve root Mongo credentials. Skipping database cleanup."
+                fi
+            else
+                log_error "Central infrastructure .env not found. Skipping database cleanup."
+            fi
         fi
     else
         log_info "3. Preserving database data and user permissions."
     fi
 
     # 4. Handle Backups cleanup
-    if [ "$DESTROY_BACKUPS" = "delete" ]; then
+    if [ "$local_destroy_backups" = "delete" ]; then
         if [ -d "$APP_DIR/backups" ]; then
             log_info "4. Deleting backups under '$APP_DIR/backups'..."
             sudo rm -rf "$APP_DIR/backups"
@@ -1432,8 +2268,8 @@ do_destroy_app() {
     fi
 
     # 5. Handle Parameters / Workspace cleanup
-    if [ "$DESTROY_PARAMS" = "delete" ]; then
-        if [ "$DESTROY_BACKUPS" = "keep" ] && [ -d "$APP_DIR/backups" ]; then
+    if [ "$local_destroy_params" = "delete" ]; then
+        if [ "$local_destroy_backups" = "keep" ] && [ -d "$APP_DIR/backups" ]; then
             log_info "5. Deleting application configurations inside '$APP_DIR' while preserving backups..."
             sudo find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name "backups" -exec rm -rf {} +
             log_success "Application configurations deleted, backups preserved."
@@ -1450,17 +2286,21 @@ do_destroy_app() {
 }
 
 do_backup() {
-    APP_NAME=$(echo "$APP_NAME" | tr '.' '-')
-    # Sanitize backup description to prevent path traversal and invalid filename characters
-    BACKUP_DESC=$(printf "%s" "$BACKUP_DESC" | tr -c 'a-zA-Z0-9_-' '_')
+    local ENV_FILE MONGO_ROOT_USER MONGO_ROOT_PASSWORD APP_DIR TIMESTAMP DB_NAME BACKUP_DIR FILE_NAME BACKUP_FILE STATUS
+    APP_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
+    # Validate backup description to prevent path traversal and invalid filename characters
+    if [ -n "$BACKUP_DESC" ] && [[ ! "$BACKUP_DESC" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        log_error "Invalid --description value: '$BACKUP_DESC'. Only alphanumeric characters, hyphens, and underscores are allowed."
+        exit 1
+    fi
     ENV_FILE="$INFRA_DIR/.env"
     if [ ! -f "$ENV_FILE" ]; then
         log_error "Central infrastructure is not installed or .env is missing. Run install first."
         exit 1
     fi
     set +e
-    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
-    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
+    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
     set -e
     if [ -z "$MONGO_ROOT_USER" ] || [ -z "$MONGO_ROOT_PASSWORD" ]; then
         log_error "Failed to retrieve MongoDB root credentials from $ENV_FILE."
@@ -1471,12 +2311,17 @@ do_backup() {
         exit 1
     fi
 
+    verify_mongodb_ready
+
     # Determine target applications
     declare -a TARGET_APPS=()
     if [ "$ALL_APPS" = true ]; then
         for d in /opt/*; do
-            if [ -d "$d" ] && [ -f "$d/docker-compose.prod.yml" ]; then
-                TARGET_APPS+=("${d##*/}")
+            [ -d "$d" ] || continue
+            APP_DIR_NAME=$(basename "$d")
+            [ "$APP_DIR_NAME" = "web-infrastructure" ] && continue
+            if [ -f "$d/docker-compose.prod.yml" ]; then
+                TARGET_APPS+=("$APP_DIR_NAME")
             fi
         done
         if [ ${#TARGET_APPS[@]} -eq 0 ]; then
@@ -1532,15 +2377,16 @@ do_backup() {
 }
 
 do_restore() {
-    APP_NAME=$(echo "$APP_NAME" | tr '.' '-')
+    local ENV_FILE MONGO_ROOT_USER MONGO_ROOT_PASSWORD TARGET_APPS BACKUP_FILES app BACKUP_DIR LATEST_FILE APP_DIR SAFE_BACKUP_NAME BACKUP_FILE DB_NAME SCOPED_MONGO_URI STATUS backup_file
+    APP_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr '.' '-')
     ENV_FILE="$INFRA_DIR/.env"
     if [ ! -f "$ENV_FILE" ]; then
         log_error "Central infrastructure is not installed or .env is missing. Run install first."
         exit 1
     fi
     set +e
-    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
-    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2 | tr -d '\r')
+    MONGO_ROOT_USER=$(grep "^MONGO_ROOT_USER=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+    MONGO_ROOT_PASSWORD=$(grep "^MONGO_ROOT_PASSWORD=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
     set -e
     if [ -z "$MONGO_ROOT_USER" ] || [ -z "$MONGO_ROOT_PASSWORD" ]; then
         log_error "Failed to retrieve MongoDB root credentials from $ENV_FILE."
@@ -1551,14 +2397,19 @@ do_restore() {
         exit 1
     fi
 
+    verify_mongodb_ready
+
     # Determine target applications and backups
     declare -a TARGET_APPS=()
     declare -a BACKUP_FILES=()
 
     if [ "$ALL_APPS" = true ]; then
         for d in /opt/*; do
-            if [ -d "$d" ] && [ -f "$d/docker-compose.prod.yml" ]; then
-                app="${d##*/}"
+            [ -d "$d" ] || continue
+            APP_DIR_NAME=$(basename "$d")
+            [ "$APP_DIR_NAME" = "web-infrastructure" ] && continue
+            if [ -f "$d/docker-compose.prod.yml" ]; then
+                app="$APP_DIR_NAME"
                 # Find the latest backup
                 BACKUP_DIR="/opt/$app/backups"
                 if [ -d "$BACKUP_DIR" ]; then
@@ -1613,6 +2464,90 @@ do_restore() {
         log_info "1. Stopping application '$app' before restore..."
         do_stop "$app" >/dev/null || true
 
+        # 1.5. Ensure database user exists (self-healing after data wipe)
+        local IMAGE
+        IMAGE=$(grep "image:" "/opt/$app/docker-compose.prod.yml" | head -n 1 | awk '{print $2}')
+        IMAGE=$(echo "$IMAGE" | tr -d '"'\')
+
+        local SCOPED_MONGO_URI=""
+        SCOPED_MONGO_URI=$(timeout 10 podman run --rm --entrypoint "" --secret "${app}_mongo_uri" mongo:7.0 cat "/run/secrets/${app}_mongo_uri" 2>/dev/null || \
+                           timeout 10 podman run --rm --entrypoint "" --secret "${app}_mongo_uri" "${IMAGE}" cat "/run/secrets/${app}_mongo_uri" 2>/dev/null || \
+                           timeout 10 podman run --rm --entrypoint "" --secret "${app}_mongo_uri" docker.io/library/busybox:latest cat "/run/secrets/${app}_mongo_uri" 2>/dev/null || \
+                           timeout 10 podman run --rm --entrypoint "" --secret "${app}_mongo_uri" docker.io/library/alpine:latest cat "/run/secrets/${app}_mongo_uri" 2>/dev/null || true)
+        local app_db_user="user_$(echo "$app" | tr '-' '_' | tr '.' '_')"
+        local app_db_password=""
+
+        local credentials_regenerated=false
+
+        if [ -n "$SCOPED_MONGO_URI" ]; then
+            local uri_no_proto="${SCOPED_MONGO_URI#mongodb://}"
+            local credentials="${uri_no_proto%%@*}"
+            app_db_user="${credentials%%:*}"
+            app_db_password="${credentials#*:}"
+            log_info "Ensuring existing database user '${app_db_user}' exists in MongoDB..."
+        else
+            credentials_regenerated=true
+            log_warn "Podman secret '${app}_mongo_uri' is missing! Automatically regenerating database credentials..."
+            app_db_password=$(openssl rand -hex 16 2>/dev/null || gpg --gen-random --armor 1 16 2>/dev/null || dd if=/dev/urandom bs=1 count=16 2>/dev/null | od -An -vtx1 | tr -d ' \n' || echo "AppPass$(date +%s%N)")
+            SCOPED_MONGO_URI="mongodb://${app_db_user}:${app_db_password}@shared_production_mongodb:27017/${DB_NAME}?authSource=${DB_NAME}"
+            
+            podman secret rm "${app}_mongo_uri" >/dev/null 2>&1 || true
+            printf "%s" "$SCOPED_MONGO_URI" | podman secret create "${app}_mongo_uri" -
+            log_success "Regenerated Podman secret: ${app}_mongo_uri"
+        fi
+
+        set +e
+        if [ "$credentials_regenerated" = true ]; then
+            podman exec -i \
+                -e DB_NAME="${DB_NAME}" \
+                -e APP_DB_USER="${app_db_user}" \
+                -e APP_DB_PASSWORD="${app_db_password}" \
+                shared_production_mongodb mongosh \
+                -u "$MONGO_ROOT_USER" \
+                -p "$MONGO_ROOT_PASSWORD" \
+                --authenticationDatabase admin \
+                --eval "
+                    db = db.getSiblingDB(process.env.DB_NAME);
+                    const dbUser = process.env.APP_DB_USER;
+                    const dbPassword = process.env.APP_DB_PASSWORD;
+                    if (!db.getUser(dbUser)) {
+                        db.createUser({
+                            user: dbUser,
+                            pwd: dbPassword,
+                            roles: [{ role: 'readWrite', db: process.env.DB_NAME }]
+                        });
+                    } else {
+                        db.changeUserPassword(dbUser, dbPassword);
+                    }
+                " >/dev/null
+        else
+            podman exec -i \
+                -e DB_NAME="${DB_NAME}" \
+                -e APP_DB_USER="${app_db_user}" \
+                -e APP_DB_PASSWORD="${app_db_password}" \
+                shared_production_mongodb mongosh \
+                -u "$MONGO_ROOT_USER" \
+                -p "$MONGO_ROOT_PASSWORD" \
+                --authenticationDatabase admin \
+                --eval "
+                    db = db.getSiblingDB(process.env.DB_NAME);
+                    const dbUser = process.env.APP_DB_USER;
+                    const dbPassword = process.env.APP_DB_PASSWORD;
+                    if (!db.getUser(dbUser)) {
+                        db.createUser({
+                            user: dbUser,
+                            pwd: dbPassword,
+                            roles: [{ role: 'readWrite', db: process.env.DB_NAME }]
+                        });
+                    }
+                " >/dev/null
+        fi
+        STATUS=$?
+        set -e
+        if [ $STATUS -ne 0 ]; then
+            log_warn "Failed to verify or provision database user '${app_db_user}' in MongoDB. Database operations might fail."
+        fi
+
         # 2. Run mongorestore
         log_info "2. Restoring database '$DB_NAME' from '$backup_file'..."
         set +e
@@ -1637,6 +2572,90 @@ do_restore() {
         log_info "3. Restarting application '$app'..."
         do_start "$app" >/dev/null || true
     done
+}
+
+do_completion() {
+    cat <<'EOF'
+_approuter_completion() {
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # Subcommands (including help)
+    local subcommands="install uninstall create-app list start stop restart logs configure update destroy-app backup restore completion help"
+
+    # Check if a subcommand is already typed in the command line
+    local i cmd=""
+    for ((i=1; i<COMP_CWORD; i++)); do
+        if [[ " ${subcommands} " =~ " ${COMP_WORDS[i]} " ]]; then
+            cmd="${COMP_WORDS[i]}"
+            break
+        fi
+    done
+
+    if [[ -n "$cmd" ]]; then
+        # Complete app names for commands that take app name as positional argument
+        if [[ " start stop restart logs configure update destroy-app " =~ " ${cmd} " ]] && [[ ! "$cur" =~ ^- ]] && [[ ! "$prev" =~ ^-- ]]; then
+            local apps=""
+            apps=$(find /opt/ -mindepth 2 -maxdepth 2 -name "docker-compose.prod.yml" 2>/dev/null | cut -d/ -f3)
+            COMPREPLY=( $(compgen -W "${apps}" -- ${cur}) )
+            return 0
+        fi
+
+        # Complete app names after --app-name option
+        if [[ " backup restore " =~ " ${cmd} " ]] && [[ "$prev" == "--app-name" ]]; then
+            local apps=""
+            apps=$(find /opt/ -mindepth 2 -maxdepth 2 -name "docker-compose.prod.yml" 2>/dev/null | cut -d/ -f3)
+            COMPREPLY=( $(compgen -W "${apps}" -- ${cur}) )
+            return 0
+        fi
+
+        case "$cmd" in
+            install)
+                opts="-d --domain -e --email -u --mongo-user -p --mongo-password"
+                ;;
+            uninstall)
+                opts="-y --non-interactive --keep-apps --destroy-apps"
+                ;;
+            create-app)
+                opts="--app-parameter --app-secret --cpu --memory --use-existing-parameters --disregard-existing-parameters --use-existing-secrets --disregard-existing-secrets --use-existing-data --disregard-existing-data"
+                ;;
+            configure)
+                opts="--app-parameter --app-secret --cpu --memory --clear-app-parameters --clear-app-secrets --clear-app-limits"
+                ;;
+            update)
+                opts="--image"
+                ;;
+            destroy-app)
+                opts="--keep-secrets --delete-secrets --keep-parameters --delete-parameters --keep-data --delete-data --keep-backups --delete-backups"
+                ;;
+            backup)
+                opts="--app-name --description --all"
+                ;;
+            restore)
+                opts="--app-name --backup-name --all"
+                ;;
+            completion)
+                opts="generate"
+                ;;
+            help)
+                opts="${subcommands}"
+                ;;
+            *)
+                opts=""
+                ;;
+        esac
+        COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+        return 0
+    fi
+
+    # Otherwise complete subcommands
+    COMPREPLY=( $(compgen -W "${subcommands}" -- ${cur}) )
+    return 0
+}
+complete -F _approuter_completion appRouter.sh ./appRouter.sh appRouter
+EOF
 }
 
 case "$ACTION" in
@@ -1678,6 +2697,9 @@ case "$ACTION" in
         ;;
     restore)
         do_restore
+        ;;
+    completion)
+        do_completion
         ;;
     *)
         show_usage

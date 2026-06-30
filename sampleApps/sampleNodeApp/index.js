@@ -7,6 +7,25 @@ if (process.argv.includes('--show-spec')) {
     process.exit(0);
 }
 
+const path = require('path');
+
+function getSecretOrEnv(secretName, envFallbackName) {
+    const secretPath = path.join('/run/secrets', secretName);
+    try {
+        if (fs.existsSync(secretPath) && fs.statSync(secretPath).isFile()) {
+            console.log(`Loading ${secretName} from container secret: ${secretPath}`);
+            return fs.readFileSync(secretPath, 'utf8').trim();
+        }
+    } catch (err) {
+        // Ignore and fallback
+    }
+    const fallbackVal = process.env[envFallbackName] || process.env[secretName] || '';
+    if (fallbackVal) {
+        console.log(`Loading ${secretName} from environment variable`);
+    }
+    return fallbackVal;
+}
+
 const express = require('express');
 const { MongoClient } = require('mongodb');
 
@@ -16,16 +35,9 @@ const appDomain = process.env.APP_DOMAIN || 'localhost';
 const multiplicationFactorEnv = process.env.multiplication_factor;
 
 // Read MongoDB connection string from container secret or fallback to env
-let mongoUri;
-const secretPath = '/run/secrets/MONGO_URI';
+const mongoUri = getSecretOrEnv('MONGO_URI', 'MONGO_URI');
 
-if (fs.existsSync(secretPath)) {
-    console.log(`Loading MongoDB URI from container secret: ${secretPath}`);
-    mongoUri = fs.readFileSync(secretPath, 'utf8').trim();
-} else if (process.env.MONGO_URI) {
-    console.log('Loading MongoDB URI from environment variable');
-    mongoUri = process.env.MONGO_URI;
-} else {
+if (!mongoUri) {
     console.error('Error: Neither /run/secrets/MONGO_URI nor MONGO_URI env variable is set.');
     process.exit(1);
 }
@@ -42,8 +54,20 @@ async function initDbAndApp() {
         // Extract database name from connection URI or default to 'sample_node_db'
         // A standard Mongo URI contains the database name after the slash before query params:
         // mongodb://user:pass@host:port/dbname?authSource=admin
-        const dbNameMatch = mongoUri.match(/\/([a-zA-Z0-9_-]+)(?:\?|$)/);
-        const dbName = dbNameMatch ? dbNameMatch[1] : 'sample_node_db';
+        let dbName = 'sample_node_db';
+        try {
+            const parsedUri = new URL(mongoUri);
+            const pathDb = parsedUri.pathname.replace(/^\//, '');
+            if (pathDb) {
+                dbName = pathDb;
+            }
+        } catch (e) {
+            // Regex fallback for non-standard connection strings
+            const dbNameMatch = mongoUri.match(/\/([a-zA-Z0-9_-]+)(?:\?|$)/);
+            if (dbNameMatch) {
+                dbName = dbNameMatch[1];
+            }
+        }
         db = dbClient.db(dbName);
         console.log(`Using database: ${dbName}`);
 
@@ -53,7 +77,11 @@ async function initDbAndApp() {
         // Clear existing proof documents
         await collection.deleteMany({});
         
-        const parsedFactor = multiplicationFactorEnv ? parseFloat(multiplicationFactorEnv) : 1;
+        let parsedFactor = multiplicationFactorEnv ? parseFloat(multiplicationFactorEnv) : 1;
+        if (isNaN(parsedFactor)) {
+            console.warn('Warning: Invalid multiplication_factor parameter. Falling back to 1.');
+            parsedFactor = 1;
+        }
         await collection.insertOne({ multiplication_factor: parsedFactor });
         console.log(`Persisted proof document with multiplication_factor = ${parsedFactor}`);
 

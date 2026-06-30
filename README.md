@@ -2,7 +2,7 @@
 
 A secure, unprivileged (rootless), and dynamic infrastructure gateway template for Debian/Ubuntu virtual machines, powered by **Traefik v2** and **Podman**.
 
-This repository provides an automated wrapper package to configure a production-ready edge router and shared MongoDB instance, enabling developers to deploy multiple containerized web applications dynamically with zero-downtime and zero manual configurations.
+This repository provides an automated wrapper package to configure a production-ready edge router and shared MongoDB instance, enabling developers to deploy multiple containerized web applications dynamically with zero manual configurations.
 
 ---
 
@@ -17,9 +17,13 @@ This repository provides an automated wrapper package to configure a production-
 │   └── app_router_guide__developing_app_router_compatible_application.md # Developer guide (port/secrets)
 ├── templates/
 │   └── docker-compose_infra.yaml.template # Parametrized template config for Traefik & MongoDB
-└── sampleApps/
-    ├── sampleNodeApp/                  # Reference Node.js application using Express & Mongo Secret
-    └── samplePythonApp/                # Reference Python application using FastAPI & Mongo Secret
+├── sampleApps/
+│   ├── sampleNodeApp/                  # Reference Node.js application using Express & Mongo Secret
+│   └── samplePythonApp/                # Reference Python application using FastAPI & Mongo Secret
+└── .agents/
+    └── skills/
+        └── make-project-support-appRouter-deployment/
+            └── instructions.md         # Agentic skill instructions for AppRouter compatibility
 ```
 
 ---
@@ -55,6 +59,10 @@ Once the infrastructure is live, you can deploy containerized applications on-th
 * Secrets are mounted dynamically in-memory under `/run/secrets/` (e.g. `MONGO_URI` and `ADMIN_PASSWORD`), protecting sensitive credentials from leaking to disk or environment dumps.
 * Container resource allocation is limited strictly to configured limits (e.g. 50% CPU core and 512MB RAM).
 * SSL/TLS certificates are requested and renewed **automatically** by Traefik.
+* **Leftover Resource Handling**: If the script detects existing parameter configurations, secrets, or databases for the application on the VM, it will fail with an error. You must explicitly specify how to handle these leftover resources using these flags:
+  * `--use-existing-parameters` or `--disregard-existing-parameters`
+  * `--use-existing-secrets` or `--disregard-existing-secrets`
+  * `--use-existing-data` or `--disregard-existing-data`
 
 ### 3. Application Management & Monitoring
 Once apps are deployed, you can monitor, restart, reconfigure, update, or safely destroy them through dedicated subcommands:
@@ -106,17 +114,25 @@ Once apps are deployed, you can monitor, restart, reconfigure, update, or safely
 To stop and remove all routing infrastructure, networks, and services:
 
 ```bash
-# Prompts for confirmation
+# Prompts for confirmation and retention policy (interactive wizard)
 ./appRouter.sh uninstall
 
-# Non-interactive mode (fully automated cleanup for CI/CD)
-./appRouter.sh uninstall -y
+# Specify retention policy directly: keep application configurations, database, secrets, and backups
+./appRouter.sh uninstall --keep-apps
+
+# Specify retention policy directly: completely purge all applications, databases, secrets, and backups
+./appRouter.sh uninstall --destroy-apps
+
+# Non-interactive mode (requires specifying retention policy in automated CI/CD environments)
+./appRouter.sh uninstall -y --keep-apps
+./appRouter.sh uninstall -y --destroy-apps
 ```
 
 ---
 
 ## 📖 In-Depth Guides
 
-* See [deploymentSpec.md](file:///c:/code/appRouterProject/appRouter/docs/deploymentSpec.md) for full architectural diagrams, prerequisite specifications, security controls, and auto-restart policies.
-* See [app_router_guide__github_ghcr_app_deployment_guide.md](file:///c:/code/appRouterProject/appRouter/docs/app_router_guide__github_ghcr_app_deployment_guide.md) for the complete developer packaging guide (Personal Access Tokens, tagging, pushing to GitHub Container Registry, and production pulls).
-* See [app_router_guide__developing_app_router_compatible_application.md](file:///c:/code/appRouterProject/appRouter/docs/app_router_guide__developing_app_router_compatible_application.md) for standards on structuring applications to naturally support dynamic port binding and container secret file reads.
+* See [deploymentSpec.md](docs/deploymentSpec.md) for full architectural diagrams, prerequisite specifications, security controls, and auto-restart policies.
+* See [app_router_guide__github_ghcr_app_deployment_guide.md](docs/app_router_guide__github_ghcr_app_deployment_guide.md) for the complete developer packaging guide (Personal Access Tokens, tagging, pushing to GitHub Container Registry, and production pulls).
+* See [app_router_guide__developing_app_router_compatible_application.md](docs/app_router_guide__developing_app_router_compatible_application.md) for standards on structuring applications to naturally support dynamic port binding and container secret file reads.
+

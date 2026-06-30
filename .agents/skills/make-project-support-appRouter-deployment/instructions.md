@@ -86,13 +86,105 @@ def get_secret_or_env(secret_name: str, env_fallback_name: str) -> str:
 
 # Example usage:
 mongo_uri = get_secret_or_env('MONGO_URI', 'MONGO_URI')
+# Note: ADMIN_PASSWORD is an example of an app-specific optional secret.
 admin_password = get_secret_or_env('ADMIN_PASSWORD', 'ADMIN_PASSWORD')
 ```
 
 ---
 
+### Step 3.5: Parse the Database Name from MONGO_URI Robustly
+When connecting to MongoDB, the application must extract the database name from the connection string (with a fallback name like `my_app_db` if not found). To maintain environment parity and avoid issues with custom ports or replica sets, parse this path element robustly.
+
+Avoid brittle regexes (like expecting a digit right before the slash) and use URL parsers or generic regex matches. Here is the proper implementation for common languages:
+
+#### 1. JavaScript / TypeScript (Node.js)
+```javascript
+let dbName = 'my_app_db';
+try {
+  const parsed = new URL(mongoUri);
+  const pathDb = parsed.pathname.replace(/^\//, '');
+  if (pathDb) dbName = pathDb;
+} catch (e) {
+  const match = mongoUri.match(/\/([a-zA-Z0-9_-]+)(?:\?|$)/);
+  if (match) dbName = match[1];
+}
+```
+
+#### 2. Python
+```python
+import urllib.parse
+import re
+
+try:
+    path_db = urllib.parse.urlparse(mongo_uri).path.lstrip('/')
+    db_name = path_db if path_db else "my_app_db"
+except Exception:
+    match = re.search(r'/([a-zA-Z0-9_-]+)(?:\?|$)', mongo_uri)
+    db_name = match.group(1) if match else "my_app_db"
+```
+
+#### 3. Rust
+```rust
+// Using the url crate
+let db_name = match url::Url::parse(mongo_uri) {
+    Ok(url) => url.path().trim_start_matches('/').to_string(),
+    Err(_) => "my_app_db".to_string(),
+};
+```
+
+#### 4. Go
+```go
+import (
+    "net/url"
+    "strings"
+)
+
+func getDBName(mongoURI string) string {
+    u, err := url.Parse(mongoURI)
+    if err == nil {
+        path := strings.TrimPrefix(u.Path, "/")
+        if path != "" {
+            return path
+        }
+    }
+    return "my_app_db"
+}
+```
+
+#### 5. Java / Kotlin
+```java
+import com.mongodb.ConnectionString;
+
+String dbName = "my_app_db";
+try {
+    ConnectionString conn = new ConnectionString(mongoUri);
+    if (conn.getDatabase() != null) {
+        dbName = conn.getDatabase();
+    }
+} catch (Exception e) {
+    // URL parsing fallback
+}
+```
+
+#### 6. C# / .NET
+```csharp
+using MongoDB.Driver;
+
+var mongoUrl = new MongoUrl(mongoUri);
+var dbName = mongoUrl.DatabaseName ?? "my_app_db";
+```
+
+#### 7. PHP
+```php
+$dbName = ltrim(parse_url($mongoUri, PHP_URL_PATH), '/') ?: 'my_app_db';
+```
+
+---
+
 ### Step 4: Bind Dynamically to `PORT`
-Ensure the server is not listening on a hardcoded port. Update the bootstrap code:
+The production edge router (Traefik) is hardcoded to route traffic to port `3000` inside your application container. Therefore, your application **must** bind dynamically to the port specified in the `PORT` environment variable (which the gateway automatically sets to `3000` in production) and default to `3000` during local development.
+
+Update the bootstrap code:
 * **Node.js**:
   ```javascript
   const port = process.env.PORT || 3000;
@@ -108,22 +200,32 @@ Ensure the server is not listening on a hardcoded port. Update the bootstrap cod
 
 ---
 
-### Step 5: Create docker-compose.dev.yml
-Generate a local `docker-compose.dev.yml` file to test the application locally with database container services and the local secrets mapped:
+### Step 5: Verify Path-Prefix Routing & Asset URLs
+Since the reverse proxy hosts the application under a subpath matching the application name (e.g. `https://<domain>/<app-name>`) and strips this prefix before forwarding the request to the container, any absolute links to root assets (e.g., `<script src="/main.js">` or `<a href="/login">`) will fail.
+
+Scan the application codebase and verify that all HTML links, asset references, and API redirects use either:
+1. **Relative Paths**: e.g., `<script src="./main.js">` or `<a href="login">`.
+2. **App-Prefixed Paths**: e.g., dynamically prefixing paths with the application name prefix (like `/<app-name>/main.js` or `/${APP_NAME}/main.js`).
+
+---
+
+### Step 6: Create docker-compose.dev.yml
+Generate a local `docker-compose.dev.yml` file to test the application locally with database container services and local secrets mapped:
    ```yaml
-   version: "3.8"
    services:
      web-app:
        build: .
        ports:
          - "3000:3000"
-       env_file:
-         - .env
+       environment:
+         - PORT=3000
+         - APP_DOMAIN=localhost
+         - multiplication_factor=5 # Example of an app-specific parameter
        secrets:
          - source: dev_mongo_uri
            target: MONGO_URI
          - source: dev_admin_password
-           target: ADMIN_PASSWORD
+           target: ADMIN_PASSWORD # Example of an app-specific optional secret
 
      mongo-db:
        image: mongo:7.0
@@ -132,14 +234,31 @@ Generate a local `docker-compose.dev.yml` file to test the application locally w
 
    secrets:
      dev_mongo_uri:
-       file: ./dev_mongo_uri.txt
+       file: ../dev_secrets/dev_mongo_uri.txt
      dev_admin_password:
-       file: ./dev_admin_password.txt
+       file: ../dev_secrets/dev_admin_password.txt
    ```
+
+> [!IMPORTANT]
+> The parameters and secrets shown above (`multiplication_factor`, `ADMIN_PASSWORD`, etc.) are **examples only**. Replace them with the actual parameters and secrets required by the target project, as declared in its `--show-spec` contract output.
+
+> [!IMPORTANT]
+> **Keep local secrets safe**: Do not store plain text password files inside your Git repository. It is a best practice to place them in a dedicated directory outside the repository root (e.g. `../dev_secrets/`). If you must place them inside the repository during testing, ensure they are explicitly added to your `.gitignore` file.
+
+> [!NOTE]
+> **Initialize Local Secret Files**: Write the default contents for the dev secret files in a folder outside the project directory to allow immediate local execution via `docker compose -f docker-compose.dev.yml up`:
+> 1. `../dev_secrets/dev_mongo_uri.txt`:
+>    ```text
+>    mongodb://mongo-db:27017/my_dev_db
+>    ```
+> 2. `../dev_secrets/dev_admin_password.txt`:
+>    ```text
+>    my_secure_dev_password
+>    ```
 
 ---
 
-### Step 6: Create the Dockerfile
+### Step 7: Create the Dockerfile
 Generate a standardized `Dockerfile` in the root of the project:
 * Ensure it uses lightweight official base images (e.g. `node:20-alpine`, `python:3.11-slim`).
 * Expose port `3000`.
@@ -150,7 +269,7 @@ Generate a standardized `Dockerfile` in the root of the project:
 
 ---
 
-### Step 7: Create GHCR Deployment Script
+### Step 8: Create GHCR Deployment Script
 Generate a deployment script at `scripts/deploy-ghcr.sh` that automates image publishing:
 ```bash
 #!/bin/bash

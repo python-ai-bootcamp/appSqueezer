@@ -15,7 +15,7 @@ COPY index.js ./
 
 # Define environment variables with defaults
 ENV PORT=3000
-ENV NODE_ENV=production
+ENV APP_ENV=production
 
 # Expose port dynamically (informational only)
 EXPOSE 3000

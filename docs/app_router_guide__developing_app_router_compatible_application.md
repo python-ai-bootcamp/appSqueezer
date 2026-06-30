@@ -7,7 +7,7 @@ This guide details the standards for developing applications that are compatible
 ## 1. Core Principles
 
 To ensure seamless production deployment:
-1. **Dynamic Port Binding**: Applications must never bind to a hardcoded port (like `3000` or `8000`). Instead, they must bind dynamically to the port specified in the `PORT` environment variable.
+1. **Dynamic Port Binding**: Applications must never bind to a hardcoded port. The production gateway is hardcoded to forward traffic to port `3000` inside your container, meaning your application **must** bind dynamically to the port specified in the `PORT` environment variable (which the gateway automatically sets to `3000` in production) and default to `3000` locally.
 2. **Secrets-Based Configuration**: Applications must load sensitive data (like database connection strings and custom passwords) from files inside the `/run/secrets/` directory instead of environment variables.
 3. **The `--show-spec` Contract**: The container image must support a `--show-spec` flag that outputs its required environment parameters and secrets to stdout.
 4. **Environment Parity Fallbacks**: During local development, the code should support fallback options (like checking standard env vars if secret files do not exist) so developers can run the app without manual mounts.
@@ -96,13 +96,15 @@ else:
 The wrapper utility generates a `.env.production` file for each application, passing `PORT` and `APP_DOMAIN` automatically.
 
 ### Port Binding
+Because the edge router (Traefik) expects downstream container services to listen on port `3000`, the orchestrator automatically writes `PORT=3000` to `.env.production` for your application container. Your code must read this value and bind to it dynamically.
+
 * **Node.js Express**:
   ```javascript
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log(`Server running on port ${port}`));
   ```
 * **Python Uvicorn (Dockerfile)**:
-  Ensure your `Dockerfile` uses the exec-form `ENTRYPOINT` to allow arguments (like `--show-spec`) to be forwarded correctly:
+  Ensure your application binds to the environment variable inside the code, and ensure your `Dockerfile` uses the exec-form `ENTRYPOINT` to allow arguments (like `--show-spec`) to be forwarded correctly:
   ```dockerfile
   ENTRYPOINT ["python", "main.py"]
   ```
@@ -113,6 +115,14 @@ The `APP_DOMAIN` variable is copied dynamically from the central router infrastr
 const domain = process.env.APP_DOMAIN || 'localhost';
 ```
 
+### Path-Prefix Routing & Asset URLs
+
+Because `appRouter` hosts applications under path prefixes (e.g., `https://<domain>/<app-name>`) and strips this prefix before forwarding the request to the container, absolute links to root assets (e.g., `<script src="/main.js">` or `<a href="/login">`) will fail. The client browser will request `https://<domain>/main.js` instead of the correct path, which bypasses the application and returns a 404 error.
+
+To avoid this, ensure that all HTML links, asset references, and API redirects use either:
+1. **Relative Paths**: e.g., `<script src="./main.js">` or `<a href="login">`.
+2. **App-Prefixed Paths**: Prefix all routing paths with the application name (e.g., `/<app-name>/main.js`), matching the route prefix in production.
+
 ---
 
 ## 4. Local Development Environment Setup (PC Parity)
@@ -121,8 +131,6 @@ To test your application locally using Docker while mimicking the production sec
 
 ### Example `docker-compose.dev.yml`
 ```yaml
-version: "3.8"
-
 services:
   web-app:
     build: .
@@ -131,12 +139,12 @@ services:
     environment:
       - PORT=3000
       - APP_DOMAIN=localhost
-      - multiplication_factor=5
+      - multiplication_factor=5 # Example of an app-specific parameter
     secrets:
       - source: dev_mongo_uri
         target: MONGO_URI # Mounts as /run/secrets/MONGO_URI
       - source: dev_admin_password
-        target: ADMIN_PASSWORD # Mounts as /run/secrets/ADMIN_PASSWORD
+        target: ADMIN_PASSWORD # Example of an app-specific optional secret
 
   mongo-db:
     image: mongo:7.0
@@ -145,17 +153,31 @@ services:
 
 secrets:
   dev_mongo_uri:
-    file: ./dev_mongo_uri.txt # Local connection string file
+    file: ../dev_secrets/dev_mongo_uri.txt # Local connection string file (kept outside the Git repo)
   dev_admin_password:
-    file: ./dev_admin_password.txt # Local secret file containing your admin password
+    file: ../dev_secrets/dev_admin_password.txt # Local secret file containing your admin password (kept outside the Git repo)
 ```
 
-1. Create local credential text files in your project directory:
-   * `dev_mongo_uri.txt`:
+> [!IMPORTANT]
+> **Keep local secrets safe**: Do not store plain text password files inside your Git repository. It is a best practice to place them in a dedicated directory outside the repository root (e.g. `../dev_secrets/`). If you must place them inside the repository during testing, ensure they are explicitly added to your `.gitignore` file.
+
+> [!NOTE]
+> **Initialize Local Secret Files**: Write the default contents for the dev secret files in a folder outside the project directory to allow immediate local execution via `docker compose -f docker-compose.dev.yml up`:
+> 1. `../dev_secrets/dev_mongo_uri.txt`:
+>    ```text
+>    mongodb://mongo-db:27017/my_dev_db
+>    ```
+> 2. `../dev_secrets/dev_admin_password.txt`:
+>    ```text
+>    my_secure_dev_password
+>    ```
+
+1. Create a directory named `dev_secrets` outside the project root and add the text files:
+   * `../dev_secrets/dev_mongo_uri.txt`:
      ```text
      mongodb://mongo-db:27017/my_dev_database
      ```
-   * `dev_admin_password.txt`:
+   * `../dev_secrets/dev_admin_password.txt`:
      ```text
      my_secure_dev_password
      ```
