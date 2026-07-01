@@ -97,6 +97,10 @@ The installer accepts CLI parameters (or falls back to defaults) and writes them
 - `MONGO_ROOT_USER`: Database administrator username, configured using the `-u` / `--mongo-user` flag (defaults to `admin_user`).
 - `MONGO_ROOT_PASSWORD`: Secure root credentials, configured using the `-p` / `--mongo-password` flag (auto-generated if omitted).
 
+> [!NOTE]
+> **Credential Reuse on Re-installation**:
+> If the installer script is re-run (e.g. to update the central domain or administrative email) and the MongoDB root credentials options (`-u`/`--mongo-user` and `-p`/`--mongo-password`) are omitted, the installer automatically parses and reuses the existing user credentials from the `/opt/web-infrastructure/.env` file. This prevents unintended modification or loss of access to existing databases.
+
 ### B. Simplified Downstream Routing
 Because Traefik binds the central `APP_DOMAIN` globally to handle certificate resolution:
 1. Downstream applications (Phase 2) do not need to repeat the domain name or configure an ACME certresolver.

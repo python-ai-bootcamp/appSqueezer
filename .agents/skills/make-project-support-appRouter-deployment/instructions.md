@@ -262,10 +262,10 @@ Generate a local `docker-compose.dev.yml` file to test the application locally w
 Generate a standardized `Dockerfile` in the root of the project:
 * Ensure it uses lightweight official base images (e.g. `node:20-alpine`, `python:3.11-slim`).
 * Expose port `3000`.
-* Ensure that the execution command uses **exec form ENTRYPOINT** rather than `CMD` (so that `podman run --rm <image> --show-spec` appends CLI arguments correctly instead of overriding the startup command).
+* Exec-form `ENTRYPOINT` is preferred rather than `CMD` (so that `podman run --rm <image> --show-spec` appends CLI arguments correctly instead of overriding the startup command). Note that CMD-only configurations are still supported since the orchestrator can inspect and run CMD elements, but direct process execution via exec-form `ENTRYPOINT` provides cleaner signal handling and faster shutdowns.
   * **Correct Node**: `ENTRYPOINT ["node", "index.js"]`
   * **Correct Python**: `ENTRYPOINT ["python", "main.py"]`
-  * **Note on Package Manager Wrappers**: If you use a package manager wrapper like `ENTRYPOINT ["npm", "start"]`, the orchestrator script is designed to automatically detect this and prepend `--` to forward the argument (i.e. `npm start -- --show-spec`). However, direct process execution (`node`) is preferred for proper OS signal handling and faster shutdowns.
+  * **Note on Package Manager Wrappers**: If you use a package manager wrapper (like `ENTRYPOINT ["npm", "start"]` or `CMD ["npm", "start"]`), the orchestrator script is designed to automatically detect this and prepend `--` to forward the argument (e.g., `npm start -- --show-spec`).
 
 ---
 
