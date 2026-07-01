@@ -1,6 +1,6 @@
-# Agentic Skill - Make Project Support appRouter Deployment
+# Agentic Skill - Make Project Support instanceSqueeze Deployment
 
-This skill teaches you how to automatically refactor and prepare any web application repository to support dynamic deployment on a production VM using the rootless `appRouter.sh` orchestrator.
+This skill teaches you how to automatically refactor and prepare any web application repository to support dynamic deployment on a production VM using the rootless `instanceSqueeze.sh` orchestrator.
 
 ---
 
@@ -291,6 +291,6 @@ docker push ghcr.io/$GHCR_USER/$APP_NAME:latest
 
 echo -e "\nDeployment setup ready!"
 echo -e "Copy and run this command on your production VM:"
-echo -e "  ./appRouter.sh create-app ghcr.io/$GHCR_USER/$APP_NAME:latest"
+echo -e "  ./instanceSqueeze.sh create-app ghcr.io/$GHCR_USER/$APP_NAME:latest"
 ```
 Make the script executable: `chmod +x scripts/deploy-ghcr.sh`.

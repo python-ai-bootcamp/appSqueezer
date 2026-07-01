@@ -34,20 +34,20 @@ To set up this architecture from scratch on a vanilla VM, the following dependen
 
 ---
 
-## 3. Automation Lifecycle (`appRouter.sh`)
+## 3. Automation Lifecycle (`instanceSqueeze.sh`)
 
-The deployment process is automated using a single wrapper utility `appRouter.sh`.
+The deployment process is automated using a single wrapper utility `instanceSqueeze.sh`.
 
 ### A. The `install` Command Execution Flow
 
 ```mermaid
 sequenceDiagram
     participant Admin as Operator
-    participant Script as appRouter.sh
+    participant Script as instanceSqueeze.sh
     participant System as Linux System
     participant Podman as Podman Engine
 
-    Admin->>Script: Run: ./appRouter.sh install -d <domain> [flags]
+    Admin->>Script: Run: ./instanceSqueeze.sh install -d <domain> [flags]
     Script->>System: Install dependencies via apt (sudo)
     Script->>System: Enable/start systemd podman.socket & podman-restart.service (user-level)
     Script->>System: Verify/Create directories under /opt/web-infrastructure
@@ -113,7 +113,7 @@ Because Traefik binds the central `APP_DOMAIN` globally to handle certificate re
 To simplify adding new applications to the VM setup, the `create-app` command automates application deployment.
 
 ```sh
-./appRouter.sh create-app <container-image-url> [--app-parameter "KEY=VALUE"]... [--app-secret "KEY=VALUE"]... [--cpu <limit>] [--memory <limit>] [--use-existing-parameters | --disregard-existing-parameters] [--use-existing-secrets | --disregard-existing-secrets] [--use-existing-data | --disregard-existing-data]
+./instanceSqueeze.sh create-app <container-image-url> [--app-parameter "KEY=VALUE"]... [--app-secret "KEY=VALUE"]... [--cpu <limit>] [--memory <limit>] [--use-existing-parameters | --disregard-existing-parameters] [--use-existing-secrets | --disregard-existing-secrets] [--use-existing-data | --disregard-existing-data]
 ```
 
 ### Options:
@@ -148,27 +148,27 @@ To simplify adding new applications to the VM setup, the `create-app` command au
 
 ## 8. Application Lifecycle & Configuration Management
 
-To manage deployed applications, `appRouter.sh` provides dedicated subcommands under the same unprivileged user context.
+To manage deployed applications, `instanceSqueeze.sh` provides dedicated subcommands under the same unprivileged user context.
 
 ### A. Lifecycle Controls
 Manage container states without altering configurations:
 * **`list`**: Scans `/opt/*` workspaces and queries Podman to display application names, route URLs, and runtime status.
   ```sh
-  ./appRouter.sh list
+  ./instanceSqueeze.sh list
   ```
 * **`start <app-name>`**: Boots the application container using `podman-compose up -d`.
 * **`stop <app-name>`**: Shuts down the container gracefully using `podman-compose down`.
 * **`restart <app-name>`**: Stops and recreates the container using `podman-compose down && podman-compose up -d` to ensure any configuration, secret, or environment updates are applied.
-* **`logs <app-name> [options]`**: Proxies logs directly from the container. Supports passing standard options (e.g. `./appRouter.sh logs my-app -f --tail 100`).
+* **`logs <app-name> [options]`**: Proxies logs directly from the container. Supports passing standard options (e.g. `./instanceSqueeze.sh logs my-app -f --tail 100`).
 
 ### B. Configuration Updates (`configure`)
 Allows updating parameters and secrets for already deployed applications. It parses and merges new values with the existing environment:
 ```sh
-./appRouter.sh configure <app-name> [--app-parameter "K=V"]... [--app-secret "K=V"]... [--cpu <val>] [--memory <val>] [--clear-app-parameters] [--clear-app-secrets] [--clear-app-limits]
+./instanceSqueeze.sh configure <app-name> [--app-parameter "K=V"]... [--app-secret "K=V"]... [--cpu <val>] [--memory <val>] [--clear-app-parameters] [--clear-app-secrets] [--clear-app-limits]
 ```
 * **Merge Logic**: Overwrites specified keys/limits while retaining existing configurations inside `.env.production` and `docker-compose.prod.yml`.
   > [!IMPORTANT]
-  > The `configure` command only updates configuration files on the host disk and secret stores. It **does not auto-restart** the running application container. The operator must run `./appRouter.sh restart <app-name>` explicitly to apply configuration updates.
+  > The `configure` command only updates configuration files on the host disk and secret stores. It **does not auto-restart** the running application container. The operator must run `./instanceSqueeze.sh restart <app-name>` explicitly to apply configuration updates.
 * **Bypass Secret Input**: Evaluates contract checks against already registered secrets, eliminating the need to re-type existing database passwords or third-party keys.
   > [!NOTE]
   > Unlike `create-app` or `update`, the `configure` subcommand does not pull container image layers from remote registries. It performs contract verification strictly against the already cached local image of the application.
@@ -179,7 +179,7 @@ Allows updating parameters and secrets for already deployed applications. It par
 ### C. Container Updates (`update`)
 Re-pulls the image tags and updates the service:
 ```sh
-./appRouter.sh update <app-name> [--image <new-image-url>]
+./instanceSqueeze.sh update <app-name> [--image <new-image-url>]
 ```
 * **Image Tag Update**: Re-pulls the current container layers and recreates the container under the same tag.
 * **Image Switching**: Updates the image pointer (using `--image`) and validates contract requirements against the existing merged parameters/secrets before re-deploying.
@@ -187,7 +187,7 @@ Re-pulls the image tags and updates the service:
 ### D. Clean Deletion (`destroy-app`)
 Completely stops the container and removes configured assets, requiring explicit choices for all cleanup groups:
 ```sh
-./appRouter.sh destroy-app <app-name> [--keep-secrets | --delete-secrets] [--keep-parameters | --delete-parameters] [--keep-data | --delete-data] [--keep-backups | --delete-backups]
+./instanceSqueeze.sh destroy-app <app-name> [--keep-secrets | --delete-secrets] [--keep-parameters | --delete-parameters] [--keep-data | --delete-data] [--keep-backups | --delete-backups]
 ```
 * **Mandatory Flags**: For security, exactly one choice from each group must be explicitly supplied:
   * **Secrets**: `--keep-secrets` (keep Podman secrets) or `--delete-secrets` (deletes `${APP_NAME}_mongo_uri` and `${APP_NAME}_secret_*` from the VM host).
@@ -200,16 +200,16 @@ Completely stops the container and removes configured assets, requiring explicit
 
 ## 9. Database Backup & Restore
 
-To ensure business continuity and local restore capabilities, `appRouter.sh` automates MongoDB backup and restore operations per application database.
+To ensure business continuity and local restore capabilities, `instanceSqueeze.sh` automates MongoDB backup and restore operations per application database.
 
 ### A. Backup Command
 Generates compressed MongoDB database dumps:
 ```sh
 # Backup single app database
-./appRouter.sh backup --app-name=<app-name> [--description=<suffix>]
+./instanceSqueeze.sh backup --app-name=<app-name> [--description=<suffix>]
 
 # Backup all app databases individually
-./appRouter.sh backup --all [--description=<suffix>]
+./instanceSqueeze.sh backup --all [--description=<suffix>]
 ```
 * **Storage Location**: Saved locally under `/opt/<app-name>/backups/` owned by the unprivileged operator.
 * **Naming Convention**: Filenames are formatted as: `YYYY_MM_DD__hh_mm_ss__<description>.gzip` (e.g. `2026_06_27__21_46_26__pre_upgrade.gzip`). The `--description` value only accepts alphanumeric characters, hyphens, and underscores.
@@ -220,10 +220,10 @@ Generates compressed MongoDB database dumps:
 Restores a database from a compressed dump, dropping existing collections first for a clean import state:
 ```sh
 # Restore single app database
-./appRouter.sh restore --app-name=<app-name> --backup-name=<filename>
+./instanceSqueeze.sh restore --app-name=<app-name> --backup-name=<filename>
 
 # Restore all apps to their latest available backups
-./appRouter.sh restore --all
+./instanceSqueeze.sh restore --all
 ```
 * **Automation Flow**:
   1. Gracefully stops the target application container(s) to avoid write conflicts.

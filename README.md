@@ -1,4 +1,4 @@
-# Rootless Edge Router & Database Gateway (`appRouter`)
+# Rootless Edge Router & Database Gateway (`instanceSqueeze`)
 
 A secure, unprivileged (rootless), and dynamic infrastructure gateway template for Debian/Ubuntu virtual machines, powered by **Traefik v2** and **Podman**.
 
@@ -10,11 +10,11 @@ This repository provides an automated wrapper package to configure a production-
 
 ```text
 ├── README.md                           # Main project overview
-├── appRouter.sh                        # Automation wrapper utility (Setup / Teardown / App Creation)
+├── instanceSqueeze.sh                  # Automation wrapper utility (Setup / Teardown / App Creation)
 ├── docs/
 │   ├── deploymentSpec.md               # Detailed system design, security features & architecture
-│   ├── app_router_guide__github_ghcr_app_deployment_guide.md # Workstation -> GHCR -> VM lifecycle
-│   └── app_router_guide__developing_app_router_compatible_application.md # Developer guide (port/secrets)
+│   ├── instance_squeeze_guide__github_ghcr_app_deployment_guide.md # Workstation -> GHCR -> VM lifecycle
+│   └── instance_squeeze_guide__developing_instance_squeeze_compatible_application.md # Developer guide (port/secrets)
 ├── templates/
 │   └── docker-compose_infra.yaml.template # Parametrized template config for Traefik & MongoDB
 ├── sampleApps/
@@ -22,8 +22,8 @@ This repository provides an automated wrapper package to configure a production-
 │   └── samplePythonApp/                # Reference Python application using FastAPI & Mongo Secret
 └── .agents/
     └── skills/
-        └── make-project-support-appRouter-deployment/
-            └── instructions.md         # Agentic skill instructions for AppRouter compatibility
+        └── make-project-support-instanceSqueeze-deployment/
+            └── instructions.md         # Agentic skill instructions for InstanceSqueeze compatibility
 ```
 
 ---
@@ -35,7 +35,7 @@ To initialize the edge router (Traefik) and shared MongoDB database on a clean, 
 
 ```bash
 # Clone the repository onto the VM, navigate to directory, then run:
-./appRouter.sh install -d api.yourdomain.com -e your-email@domain.com
+./instanceSqueeze.sh install -d api.yourdomain.com -e your-email@domain.com
 ```
 
 * **`-d` / `--domain`**: The central domain under which all applications will be routed.
@@ -47,10 +47,10 @@ Once the infrastructure is live, you can deploy containerized applications on-th
 
 ```bash
 # General deployment
-./appRouter.sh create-app ghcr.io/username/my-backend-service:latest
+./instanceSqueeze.sh create-app ghcr.io/username/my-backend-service:latest
 
 # Deployment passing custom app-specific parameters, secrets, and CPU/Memory limits
-./appRouter.sh create-app ghcr.io/username/my-backend-service:latest \
+./instanceSqueeze.sh create-app ghcr.io/username/my-backend-service:latest \
   --app-parameter "multiplication_factor=5" \
   --app-secret "ADMIN_PASSWORD=my_secure_prod_password" \
   --cpu "0.5" --memory "512M"
@@ -69,42 +69,42 @@ Once apps are deployed, you can monitor, restart, reconfigure, update, or safely
 
 ```bash
 # List all deployed apps and check if they are running/stopped
-./appRouter.sh list
+./instanceSqueeze.sh list
 
 # View/Stream container logs
-./appRouter.sh logs my-backend-service -f --tail 100
+./instanceSqueeze.sh logs my-backend-service -f --tail 100
 
 # Stop / Start / Restart apps
-./appRouter.sh stop my-backend-service
-./appRouter.sh start my-backend-service
-./appRouter.sh restart my-backend-service
+./instanceSqueeze.sh stop my-backend-service
+./instanceSqueeze.sh start my-backend-service
+./instanceSqueeze.sh restart my-backend-service
 
 # Reconfigure parameters/limits (retains other settings, merges changes)
-./appRouter.sh configure my-backend-service --app-parameter "multiplication_factor=10" --cpu "1.0"
+./instanceSqueeze.sh configure my-backend-service --app-parameter "multiplication_factor=10" --cpu "1.0"
 # Cleans up parameters/limits slate before writing new ones
-./appRouter.sh configure my-backend-service --clear-app-parameters --clear-app-limits --memory "256M"
+./instanceSqueeze.sh configure my-backend-service --clear-app-parameters --clear-app-limits --memory "256M"
 
 # Pull the latest image layers and recreate container in-place
-./appRouter.sh update my-backend-service
+./instanceSqueeze.sh update my-backend-service
 # Switch app to a different image tag/url, verifying contract requirements
-./appRouter.sh update my-backend-service --image ghcr.io/username/my-backend-service:v2.0
+./instanceSqueeze.sh update my-backend-service --image ghcr.io/username/my-backend-service:v2.0
 
 # Database Backup & Restore operations
 # Take a backup of a single app's database with a suffix description
-./appRouter.sh backup --app-name=my-backend-service --description=pre_upgrade
+./instanceSqueeze.sh backup --app-name=my-backend-service --description=pre_upgrade
 # Take individual backups for ALL deployed apps
-./appRouter.sh backup --all
+./instanceSqueeze.sh backup --all
 
 # Restore an app from a specific backup file (purges current collection data first)
-./appRouter.sh restore --app-name=my-backend-service --backup-name=2026_06_27__21_46_26__pre_upgrade.gzip
+./instanceSqueeze.sh restore --app-name=my-backend-service --backup-name=2026_06_27__21_46_26__pre_upgrade.gzip
 # Restore all apps to their respective latest available backups
-./appRouter.sh restore --all
+./instanceSqueeze.sh restore --all
 
 # Completely wipe everything (secrets, parameters, backups, and database data):
-./appRouter.sh destroy-app my-backend-service --delete-secrets --delete-parameters --delete-data --delete-backups
+./instanceSqueeze.sh destroy-app my-backend-service --delete-secrets --delete-parameters --delete-data --delete-backups
 
 # Delete the container & configs, but keep the database backups and secrets intact:
-./appRouter.sh destroy-app my-backend-service --keep-secrets --delete-parameters --keep-data --keep-backups
+./instanceSqueeze.sh destroy-app my-backend-service --keep-secrets --delete-parameters --keep-data --keep-backups
 ```
 
 ---
@@ -115,17 +115,17 @@ To stop and remove all routing infrastructure, networks, and services:
 
 ```bash
 # Prompts for confirmation and retention policy (interactive wizard)
-./appRouter.sh uninstall
+./instanceSqueeze.sh uninstall
 
 # Specify retention policy directly: keep application configurations, database, secrets, and backups
-./appRouter.sh uninstall --keep-apps
+./instanceSqueeze.sh uninstall --keep-apps
 
 # Specify retention policy directly: completely purge all applications, databases, secrets, and backups
-./appRouter.sh uninstall --destroy-apps
+./instanceSqueeze.sh uninstall --destroy-apps
 
 # Non-interactive mode (requires specifying retention policy in automated CI/CD environments)
-./appRouter.sh uninstall -y --keep-apps
-./appRouter.sh uninstall -y --destroy-apps
+./instanceSqueeze.sh uninstall -y --keep-apps
+./instanceSqueeze.sh uninstall -y --destroy-apps
 ```
 
 ---
@@ -133,6 +133,6 @@ To stop and remove all routing infrastructure, networks, and services:
 ## 📖 In-Depth Guides
 
 * See [deploymentSpec.md](docs/deploymentSpec.md) for full architectural diagrams, prerequisite specifications, security controls, and auto-restart policies.
-* See [app_router_guide__github_ghcr_app_deployment_guide.md](docs/app_router_guide__github_ghcr_app_deployment_guide.md) for the complete developer packaging guide (Personal Access Tokens, tagging, pushing to GitHub Container Registry, and production pulls).
-* See [app_router_guide__developing_app_router_compatible_application.md](docs/app_router_guide__developing_app_router_compatible_application.md) for standards on structuring applications to naturally support dynamic port binding and container secret file reads.
+* See [instance_squeeze_guide__github_ghcr_app_deployment_guide.md](docs/instance_squeeze_guide__github_ghcr_app_deployment_guide.md) for the complete developer packaging guide (Personal Access Tokens, tagging, pushing to GitHub Container Registry, and production pulls).
+* See [instance_squeeze_guide__developing_instance_squeeze_compatible_application.md](docs/instance_squeeze_guide__developing_instance_squeeze_compatible_application.md) for standards on structuring applications to naturally support dynamic port binding and container secret file reads.
 

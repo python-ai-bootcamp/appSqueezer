@@ -1,6 +1,6 @@
 # Application Development & Environment Parity Guide
 
-This guide details the standards for developing applications that are compatible with the rootless gateway (`appRouter`) deployment model. By following these patterns, you guarantee **100% environment parity**—your code will behave exactly the same way during local PC development (using Docker) as it does on the production VM (using Podman).
+This guide details the standards for developing applications that are compatible with the rootless gateway (`instanceSqueeze`) deployment model. By following these patterns, you guarantee **100% environment parity**—your code will behave exactly the same way during local PC development (using Docker) as it does on the production VM (using Podman).
 
 ---
 
@@ -14,7 +14,7 @@ To ensure seamless production deployment:
 
 ### 1.5 The `--show-spec` Implementation
 
-When `appRouter.sh` deploys a container, it performs a pre-flight validation check by running:
+When `instanceSqueeze.sh` deploys a container, it performs a pre-flight validation check by running:
 ```bash
 podman run --rm <image> --show-spec
 ```
@@ -117,7 +117,7 @@ const domain = process.env.APP_DOMAIN || 'localhost';
 
 ### Path-Prefix Routing & Asset URLs
 
-Because `appRouter` hosts applications under path prefixes (e.g., `https://<domain>/<app-name>`) and strips this prefix before forwarding the request to the container, absolute links to root assets (e.g., `<script src="/main.js">` or `<a href="/login">`) will fail. The client browser will request `https://<domain>/main.js` instead of the correct path, which bypasses the application and returns a 404 error.
+Because `instanceSqueeze` hosts applications under path prefixes (e.g., `https://<domain>/<app-name>`) and strips this prefix before forwarding the request to the container, absolute links to root assets (e.g., `<script src="/main.js">` or `<a href="/login">`) will fail. The client browser will request `https://<domain>/main.js` instead of the correct path, which bypasses the application and returns a 404 error.
 
 To avoid this, ensure that all HTML links, asset references, and API redirects use either:
 1. **Relative Paths**: e.g., `<script src="./main.js">` or `<a href="login">`.
@@ -188,5 +188,5 @@ secrets:
 
 At startup, the local Docker engine will mount both secret files inside `/run/secrets/` in memory. This gives your application 100% environment parity with your production VM, where the VM operator deploys with:
 ```bash
-./appRouter.sh create-app <image> --app-parameter "multiplication_factor=5" --app-secret "ADMIN_PASSWORD=my_secure_prod_password"
+./instanceSqueeze.sh create-app <image> --app-parameter "multiplication_factor=5" --app-secret "ADMIN_PASSWORD=my_secure_prod_password"
 ```

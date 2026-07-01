@@ -1,6 +1,6 @@
 # GitHub Packages (GHCR) Container Deployment Guide
 
-This guide details the complete developer lifecycle for developing an application locally on a workstation, packaging it into a container image, pushing it to the GitHub Container Registry (`ghcr.io`), and deploying it seamlessly to your production VM using the `appRouter.sh` tool.
+This guide details the complete developer lifecycle for developing an application locally on a workstation, packaging it into a container image, pushing it to the GitHub Container Registry (`ghcr.io`), and deploying it seamlessly to your production VM using the `instanceSqueeze.sh` tool.
 
 ---
 
@@ -70,7 +70,7 @@ echo "YOUR_GITHUB_PAT" | podman login ghcr.io -u YOUR_GITHUB_USERNAME --password
 Now, deploy the application dynamically by passing the container image URL to the setup utility:
 
 ```bash
-./appRouter.sh create-app ghcr.io/yourusername/my-service:latest
+./instanceSqueeze.sh create-app ghcr.io/yourusername/my-service:latest
 ```
 
 ### Automatic Behind-the-Scenes Actions:

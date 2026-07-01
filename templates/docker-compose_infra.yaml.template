@@ -45,7 +45,7 @@ services:
         max-file: "3"
 
   mongo:
-    image: mongo:7.0
+    image: docker.io/library/mongo:7.0
     container_name: shared_production_mongodb
     restart: unless-stopped
     environment:
