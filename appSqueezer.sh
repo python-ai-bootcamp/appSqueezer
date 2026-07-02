@@ -8,7 +8,6 @@ export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 
 # Configuration / Output paths
 INFRA_DIR="/opt/web-infrastructure"
-TEMPLATE_FILE="$(dirname "$0")/templates/docker-compose_infra.yaml.template"
 
 # Text Styling
 RED='\033[0;31m'
@@ -31,6 +30,32 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+verify_container_running() {
+    local container_name="$1"
+    local max_attempts=15
+    local attempt=1
+    log_info "Waiting for container '$container_name' to start..."
+    while [ $attempt -le $max_attempts ]; do
+        local status
+        status=$(podman inspect --format '{{.State.Running}}' "$container_name" 2>/dev/null || echo "false")
+        if [ "$status" = "true" ]; then
+            log_success "Container '$container_name' is running."
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    log_error "Timeout: Container '$container_name' did not start or is not running."
+    local inspect_err
+    inspect_err=$(podman inspect --format '{{.State.Error}}' "$container_name" 2>/dev/null)
+    if [ -n "$inspect_err" ]; then
+        log_error "Container inspect error: $inspect_err"
+    fi
+    log_error "Recent logs for '$container_name':"
+    podman logs "$container_name" 2>&1 | tail -n 20 >&2
+    exit 1
 }
 
 verify_mongodb_ready() {
@@ -988,11 +1013,77 @@ do_install() {
     chmod 600 "$INFRA_DIR/letsencrypt/acme.json"
 
     log_info "4. Configuring docker-compose and environment..."
-    if [ ! -f "$TEMPLATE_FILE" ]; then
-        log_error "Template file not found at $TEMPLATE_FILE. Cannot proceed."
-        exit 1
-    fi
-    cp "$TEMPLATE_FILE" "$INFRA_DIR/docker-compose.yml"
+    cat <<'EOF' > "$INFRA_DIR/docker-compose.yml"
+services:
+  traefik:
+    image: docker.io/library/traefik:v2.10
+    container_name: global_edge_router
+    restart: unless-stopped
+    command:
+      # Provider Configuration
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      
+      # Entrypoints (Ports)
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.websecure.http.tls.certResolver=letsencryptresolver"
+      
+      # Automatic HTTP to HTTPS Redirection
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      
+      # Automated SSL Certificate Generation (Let's Encrypt)
+      - "--certificatesresolvers.letsencryptresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencryptresolver.acme.email=${LETSENCRYPT_EMAIL}"
+      - "--certificatesresolvers.letsencryptresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - web_gateway
+    volumes:
+      # Map the system's user-level Podman socket to Traefik's expected Docker socket
+      - "/run/user/${USER_UID}/podman/podman.sock:/var/run/docker.sock:ro"
+      # Persist SSL certificates across container updates
+      - "./letsencrypt:/letsencrypt"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.global-tls.rule=Host(`${APP_DOMAIN}`)"
+      - "traefik.http.routers.global-tls.entrypoints=websecure"
+      - "traefik.http.routers.global-tls.tls.certresolver=letsencryptresolver"
+      - "traefik.http.routers.global-tls.service=noop@internal"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mongo:
+    image: docker.io/library/mongo:7.0
+    container_name: shared_production_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    volumes:
+      - mongo_production_data:/data/db
+    networks:
+      - web_gateway
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mongo_production_data:
+
+networks:
+  web_gateway:
+    external: true
+EOF
 
     # Write .env file
     ENV_FILE="$INFRA_DIR/.env"
@@ -1016,6 +1107,11 @@ EOF
     log_info "6. Starting Infrastructure Services via podman-compose..."
     cd "$INFRA_DIR"
     podman-compose up -d
+
+    log_info "7. Verifying infrastructure services..."
+    verify_container_running "global_edge_router"
+    verify_container_running "shared_production_mongodb"
+    verify_mongodb_ready
 
     log_success "Installation completed successfully!"
     log_success "Traefik and MongoDB are running rootless."

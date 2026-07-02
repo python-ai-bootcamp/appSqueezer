@@ -15,8 +15,6 @@ This repository provides an automated wrapper package to configure a production-
 │   ├── deploymentSpec.md               # Detailed system design, security features & architecture
 │   ├── app_squeezer_guide__github_ghcr_app_deployment_guide.md # Workstation -> GHCR -> VM lifecycle
 │   └── app_squeezer_guide__developing_app_squeezer_compatible_application.md # Developer guide (port/secrets)
-├── templates/
-│   └── docker-compose_infra.yaml.template # Parametrized template config for Traefik & MongoDB
 ├── sampleApps/
 │   ├── sampleNodeApp/                  # Reference Node.js application using Express & Mongo Secret
 │   └── samplePythonApp/                # Reference Python application using FastAPI & Mongo Secret
