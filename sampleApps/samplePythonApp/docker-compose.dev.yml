@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  # Isolated local MongoDB instance for the Python app
+  python-app-mongo-db:
+    image: mongo:7.0
+    container_name: python-app-mongo-db
+    ports:
+      - "27017:27017"
+    volumes:
+      - python-mongo-data:/data/db
+
+  # Python FastAPI app service
+  web-app:
+    build: .
+    container_name: python-sample-app
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - APP_DOMAIN=localhost
+      - multiplication_factor=3
+    depends_on:
+      - python-app-mongo-db
+    secrets:
+      - source: dev_mongo_uri
+        target: MONGO_URI
+
+secrets:
+  dev_mongo_uri:
+    file: .dev_secrets/mongo_uri.txt
+
+volumes:
+  python-mongo-data:

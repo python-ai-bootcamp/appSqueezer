@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  # Isolated local MongoDB instance for the Node app
+  node-app-mongo-db:
+    image: mongo:7.0
+    container_name: node-app-mongo-db
+    ports:
+      - "27017:27017"
+    volumes:
+      - node-mongo-data:/data/db
+
+  # Node.js app service
+  web-app:
+    build: .
+    container_name: node-sample-app
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - APP_DOMAIN=localhost
+      - multiplication_factor=5
+    depends_on:
+      - node-app-mongo-db
+    secrets:
+      - source: dev_mongo_uri
+        target: MONGO_URI
+
+secrets:
+  dev_mongo_uri:
+    file: .dev_secrets/mongo_uri.txt
+
+volumes:
+  node-mongo-data:

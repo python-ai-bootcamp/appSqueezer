@@ -1,5 +1,5 @@
 # Base image
-FROM node:20-alpine
+FROM node:20-slim
 
 # Set working directory
 WORKDIR /app
@@ -8,7 +8,8 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install production dependencies
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --verbose
+
 
 # Copy application source code
 COPY index.js ./
