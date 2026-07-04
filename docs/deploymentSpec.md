@@ -118,15 +118,15 @@ To simplify adding new applications to the VM setup, the `create-app` command au
 
 ### Options:
 * `--app-parameter`: Repeatable flag to pass custom non-sensitive environment variables directly into the application's environment file (e.g., `--app-parameter "multiplication_factor=5"`).
-* `--app-secret`: Repeatable flag to register and mount application-specific sensitive configurations (like passwords, keys) via Podman Secrets (e.g., `--app-secret "ADMIN_PASSWORD=secret"`).
+* `--app-secret`: Repeatable flag to register and mount application-specific sensitive configurations (like passwords, keys) via secure file mounts (e.g., `--app-secret "ADMIN_PASSWORD=secret"`).
 * `--cpu`: Optional allocation limit for CPU cores (e.g., `--cpu "0.5"` limits container process to 50% of one core).
 * `--memory`: Optional allocation limit for RAM (e.g., `--memory "512M"` limits container to 512MB RAM). Defaults to no limit.
 * `--use-existing-parameters` / `--disregard-existing-parameters`: Choices for managing existing parameters inside `/opt/<app-name>` if leftovers are found.
-* `--use-existing-secrets` / `--disregard-existing-secrets`: Choices for managing existing registered secrets in Podman if leftovers are found.
+* `--use-existing-secrets` / `--disregard-existing-secrets`: Choices for managing existing secrets if leftovers are found.
 * `--use-existing-data` / `--disregard-existing-data`: Choices for managing existing databases and users in MongoDB if leftovers are found.
 
 ### Automation Flow:
-1. **Leftovers Verification**: Scans the host for existing parameters (configuration files in `/opt/<app-name>`), secrets (in Podman), and data (users/databases in MongoDB). If any leftovers are detected and the corresponding flag is omitted, the command terminates with an error instructing the user to specify their reuse or disregard preference.
+1. **Leftovers Verification**: Scans the host for existing parameters (configuration files in `/opt/<app-name>`), secrets (folders on disk), and data (users/databases in MongoDB). If any leftovers are detected and the corresponding flag is omitted, the command terminates with an error instructing the user to specify their reuse or disregard preference.
 2. **Identifier Extraction**: The command parses the container image name from the URL (e.g., `registry.gitlab.com/username/my-service:latest` yields `my-service`).
 3. **Pre-flight Contract Verification**:
    * Pulls the image and executes a mock container instance querying its contract: `podman run --rm <image> --show-spec`.
@@ -138,9 +138,9 @@ To simplify adding new applications to the VM setup, the `create-app` command au
    * Connects to the running `shared_production_mongodb` database container via `podman exec`.
    * Provisions this user (or updates their password) with scoped `readWrite` permissions exclusively on `my_service_db` (ensuring no database root password leaks and full app-to-app data separation).
 6. **Secrets-Based Injection**: 
-   * Stores the scoped database connection URI as a Podman Secret (`my-service_mongo_uri`).
-   * Stores each app-specific secret as a Podman Secret (`my-service_secret_<KEY>`).
-   * Mounts all secrets inside the container under `/run/secrets/` (available only in the container's volatile memory filesystem, preventing plaintext passwords from sitting on the host disk).
+   * Stores the scoped database connection URI as a secure file (`/opt/my-service/secrets/MONGO_URI`).
+   * Stores each app-specific secret as a secure file (`/opt/my-service/secrets/<KEY>`).
+   * Mounts all secrets inside the container under `/run/secrets/` (using folder-scoped Compose secrets mounts, preventing plaintext passwords from sitting in global VM storage).
 7. **Path Routing Configuration**: Generates the application's `/opt/my-service/docker-compose.prod.yml` (mapping the secrets) and `/opt/my-service/.env.production` (injecting `PORT=3000`, `APP_ENV=production`, `APP_DOMAIN`, and any custom `--app-parameter` flags).
 8. **Deployment**: Triggers container initialization dynamically. The service immediately becomes live under `https://<APP_DOMAIN>/my-service`.
 
@@ -173,7 +173,7 @@ Allows updating parameters and secrets for already deployed applications. It par
   > [!NOTE]
   > Unlike `create-app` or `update`, the `configure` subcommand does not pull container image layers from remote registries. It performs contract verification strictly against the already cached local image of the application.
 * **`--clear-app-parameters`**: Clears all previous configurations from `.env.production` before writing new parameters.
-* **`--clear-app-secrets`**: Removes all app-specific `secret_*` registrations in Podman and mounts only the newly supplied secrets.
+* **`--clear-app-secrets`**: Removes all app-specific secret files under `/opt/<app-name>/secrets/` (except the database connection `MONGO_URI`) and mounts only the newly supplied secrets.
 * **`--clear-app-limits`**: Discards existing CPU and Memory allocation constraints on the container.
 
 ### C. Container Updates (`update`)
@@ -190,7 +190,7 @@ Completely stops the container and removes configured assets, requiring explicit
 ./appSqueezer.sh destroy-app <app-name> [--keep-secrets | --delete-secrets] [--keep-parameters | --delete-parameters] [--keep-data | --delete-data] [--keep-backups | --delete-backups]
 ```
 * **Mandatory Flags**: For security, exactly one choice from each group must be explicitly supplied:
-  * **Secrets**: `--keep-secrets` (keep Podman secrets) or `--delete-secrets` (deletes `${APP_NAME}_mongo_uri` and `${APP_NAME}_secret_*` from the VM host).
+  * **Secrets**: `--keep-secrets` (keep secret files) or `--delete-secrets` (deletes `/opt/${APP_NAME}/secrets` from the VM host).
   * **Parameters**: `--keep-parameters` (keep directory `/opt/<app-name>`) or `--delete-parameters` (deletes configs/compose, but respects backups preference).
   * **Data**: `--keep-data` (retains database data) or `--delete-data` (drops MongoDB database `<app-name>_db` and drops database user `user_<app-name>`).
   * **Backups**: `--keep-backups` (retains the backups folder under `/opt/<app-name>/backups/`) or `--delete-backups` (deletes all backup files).

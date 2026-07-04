@@ -77,5 +77,5 @@ Now, deploy the application dynamically by passing the container image URL to th
 1. Podman pulls down the image `ghcr.io/yourusername/my-service:latest`.
 2. The script parses the image and creates a persistent home directory at `/opt/my-service`.
 3. The script extracts the central MongoDB root credentials, generates a unique application-specific database user, and uses `podman exec` to register them with restricted `readWrite` permissions on `my_service_db`.
-4. The connection string is registered with Podman Secrets (`my-service_mongo_uri`) and the generated `/opt/my-service/docker-compose.prod.yml` mounts this secret dynamically at `/run/secrets/MONGO_URI` (along with configuring Traefik labels and `.env.production` metadata).
-5. The container pulls the secret from memory and starts up.
+4. The connection string is written to a secure folder (`/opt/my-service/secrets/MONGO_URI`) with restricted read-only permissions for the deployment user, and the generated `/opt/my-service/docker-compose.prod.yml` mounts this secret folder dynamically at `/run/secrets/` inside the container (along with configuring Traefik labels and `.env.production` metadata).
+5. The container pulls the secret from the mounted file and starts up.

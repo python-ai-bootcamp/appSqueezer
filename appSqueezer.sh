@@ -223,13 +223,13 @@ show_command_help() {
             echo ""
             echo "Options:"
             echo "  --app-parameter                  Pass environment variables to app (e.g. --app-parameter \"K=V\")"
-            echo "  --app-secret                     Pass sensitive secrets to app via Podman Secrets (e.g. --app-secret \"K=V\")"
+            echo "  --app-secret                     Pass sensitive secrets to app via secure file mounts (e.g. --app-secret \"K=V\")"
             echo "  --cpu                            CPU limit constraints (e.g. --cpu \"0.5\")"
             echo "  --memory                         Memory limit constraints (e.g. --memory \"512M\")"
             echo "  --use-existing-parameters        Re-use existing parameters if leftovers are found"
             echo "  --disregard-existing-parameters   Discard/overwrite existing parameters if leftovers are found"
-            echo "  --use-existing-secrets           Re-use existing Podman secrets if leftovers are found"
-            echo "  --disregard-existing-secrets      Discard/re-create existing Podman secrets if leftovers are found"
+            echo "  --use-existing-secrets           Re-use existing secrets if leftovers are found"
+            echo "  --disregard-existing-secrets      Discard/re-create existing secrets if leftovers are found"
             echo "  --use-existing-data              Re-use existing database and user in MongoDB if leftovers are found"
             echo "  --disregard-existing-data         Drop and re-create database and user in MongoDB if leftovers are found"
             ;;
@@ -265,7 +265,7 @@ show_command_help() {
             echo ""
             echo "Options:"
             echo "  --app-parameter         Pass environment variables to app (e.g. --app-parameter \"K=V\")"
-            echo "  --app-secret            Pass sensitive secrets to app via Podman Secrets (e.g. --app-secret \"K=V\")"
+            echo "  --app-secret            Pass sensitive secrets to app via secure file mounts (e.g. --app-secret \"K=V\")"
             echo "  --cpu                   CPU limit constraints (e.g. --cpu \"0.5\")"
             echo "  --memory                Memory limit constraints (e.g. --memory \"512M\")"
             echo "  --clear-app-parameters  Discard existing app parameters"
@@ -286,7 +286,7 @@ show_command_help() {
             echo "Halt services and permanently destroy app configurations, secrets, database, or backups."
             echo ""
             echo "Options:"
-            echo "  --keep-secrets | --delete-secrets      Keep or delete registered Podman secrets"
+            echo "  --keep-secrets | --delete-secrets      Keep or delete registered secret files"
             echo "  --keep-parameters | --delete-parameters Keep or delete configuration parameters"
             echo "  --keep-data | --delete-data            Keep or drop database and database user in MongoDB"
             echo "  --keep-backups | --delete-backups      Keep or delete database backup files"
@@ -1215,12 +1215,10 @@ do_uninstall() {
     fi
 
     if [ "$UNINSTALL_APPS_ACTION" = "destroy" ]; then
-        log_info "4. Removing all registered Podman secrets..."
-        for s in $(podman secret ls --format "{{.Name}}" 2>/dev/null | grep -E "_mongo_uri$|_secret_"); do
-            podman secret rm "$s" >/dev/null 2>&1 || true
-        done
+        log_info "4. Removing all registered secret files..."
+        # Individual secret files are cleaned up in do_destroy_app loop
     else
-        log_info "4. Keeping registered Podman secrets intact."
+        log_info "4. Keeping registered secret files intact."
     fi
 
     log_info "5. Disabling Podman user socket and restart services..."
@@ -1297,10 +1295,7 @@ do_create_app() {
     fi
 
     # Check secrets leftover
-    if podman secret inspect "${APP_NAME}_mongo_uri" >/dev/null 2>&1; then
-        secrets_exist=true
-    fi
-    if podman secret ls --format "{{.Name}}" 2>/dev/null | grep -q "^${APP_NAME}_secret_"; then
+    if [ -d "$APP_DIR/secrets" ]; then
         secrets_exist=true
     fi
 
@@ -1374,11 +1369,8 @@ do_create_app() {
     fi
 
     if [ "$secrets_exist" = true ] && [ "$DISREGARD_EXISTING_SECRETS" = true ]; then
-        log_info "Cleaning up existing secrets from Podman..."
-        podman secret rm "${APP_NAME}_mongo_uri" >/dev/null 2>&1 || true
-        for s in $(podman secret ls --format "{{.Name}}" 2>/dev/null | grep "^${APP_NAME}_secret_"); do
-            podman secret rm "$s" >/dev/null 2>&1 || true
-        done
+        log_info "Cleaning up existing secrets..."
+        sudo rm -rf "$APP_DIR/secrets"
     fi
 
     if [ "$data_exist" = true ] && [ "$DISREGARD_EXISTING_DATA" = true ]; then
@@ -1457,24 +1449,32 @@ do_create_app() {
 
     # Merge/Clear Secrets
     declare -A MAPPED_SECRETS
-    if [ "$secrets_exist" = true ] && [ "$USE_EXISTING_SECRETS" = true ] && [ -f "$APP_DIR/docker-compose.prod.yml" ]; then
-        log_info "Reusing existing custom secrets mappings..."
-        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9._-]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
-            KEY="${s_source#${APP_NAME}_secret_}"
-            MAPPED_SECRETS["$KEY"]="$s_source"
+    if [ "$secrets_exist" = true ] && [ "$USE_EXISTING_SECRETS" = true ] && [ -d "$APP_DIR/secrets" ]; then
+        log_info "Reusing existing secrets..."
+        for s_file in "$APP_DIR/secrets"/*; do
+            [ -f "$s_file" ] || continue
+            KEY=$(basename "$s_file")
+            if [ "$KEY" != "MONGO_URI" ]; then
+                MAPPED_SECRETS["$KEY"]="true"
+            fi
         done
     fi
 
-    # Register and map new app-specific secrets
+    # Write new app-specific secrets to disk
+    if [ ${#APP_SECRETS[@]} -gt 0 ] || [ -n "$SCOPED_MONGO_URI" ]; then
+        sudo mkdir -p "$APP_DIR/secrets"
+        sudo chown -R "$(id -u):$(id -g)" "$APP_DIR/secrets"
+        chmod 700 "$APP_DIR/secrets"
+    fi
+
     for secret in "${APP_SECRETS[@]}"; do
         KEY="${secret%%=*}"
         VAL="${secret#*=}"
-        SECRET_NAME="${APP_NAME}_secret_${KEY}"
         
-        log_info "Registering secret '$KEY' in Podman..."
-        podman secret rm "$SECRET_NAME" >/dev/null 2>&1 || true
-        printf "%s" "$VAL" | podman secret create "$SECRET_NAME" -
-        MAPPED_SECRETS["$KEY"]="$SECRET_NAME"
+        log_info "Registering secret '$KEY'..."
+        printf "%s" "$VAL" > "$APP_DIR/secrets/$KEY"
+        chmod 600 "$APP_DIR/secrets/$KEY"
+        MAPPED_SECRETS["$KEY"]="true"
     done
 
     # Validate parameters
@@ -1498,13 +1498,10 @@ do_create_app() {
         if [ "$req" = "MONGO_URI" ]; then
             continue
         fi
-        SECRET_NAME="${MAPPED_SECRETS[$req]}"
-        if [ -z "$SECRET_NAME" ] && podman secret inspect "${APP_NAME}_secret_${req}" >/dev/null 2>&1; then
-            SECRET_NAME="${APP_NAME}_secret_${req}"
-            MAPPED_SECRETS["$req"]="$SECRET_NAME"
-        fi
-        if [ -z "$SECRET_NAME" ] || ! podman secret inspect "$SECRET_NAME" >/dev/null 2>&1; then
+        if [ ! -f "$APP_DIR/secrets/$req" ]; then
             MISSING_SECRETS+=("$req")
+        else
+            MAPPED_SECRETS["$req"]="true"
         fi
     done
 
@@ -1540,16 +1537,12 @@ do_create_app() {
     APP_DB_PASSWORD=""
     SCOPED_MONGO_URI=""
 
-    if [ "$secrets_exist" = true ] && [ "$USE_EXISTING_SECRETS" = true ]; then
-        log_info "Reading connection URI from existing Podman secret..."
-        # Retrieve existing URI using busybox, alpine, or user image
-        SCOPED_MONGO_URI=$(timeout 10 podman run --rm --entrypoint "" --secret "${APP_NAME}_mongo_uri" docker.io/library/mongo:7.0 cat "/run/secrets/${APP_NAME}_mongo_uri" 2>/dev/null || \
-                           timeout 10 podman run --rm --entrypoint "" --secret "${APP_NAME}_mongo_uri" "${IMAGE}" cat "/run/secrets/${APP_NAME}_mongo_uri" 2>/dev/null || \
-                           timeout 10 podman run --rm --entrypoint "" --secret "${APP_NAME}_mongo_uri" docker.io/library/busybox:latest cat "/run/secrets/${APP_NAME}_mongo_uri" 2>/dev/null || \
-                           timeout 10 podman run --rm --entrypoint "" --secret "${APP_NAME}_mongo_uri" docker.io/library/alpine:latest cat "/run/secrets/${APP_NAME}_mongo_uri" 2>/dev/null || true)
+    if [ "$secrets_exist" = true ] && [ "$USE_EXISTING_SECRETS" = true ] && [ -f "$APP_DIR/secrets/MONGO_URI" ]; then
+        log_info "Reading connection URI from existing secret file..."
+        SCOPED_MONGO_URI=$(cat "$APP_DIR/secrets/MONGO_URI" 2>/dev/null || true)
         
         if [ -z "$SCOPED_MONGO_URI" ]; then
-            log_error "Failed to retrieve connection URI from existing Podman secret '${APP_NAME}_mongo_uri'."
+            log_error "Failed to retrieve connection URI from existing secret file."
             exit 1
         fi
         
@@ -1595,9 +1588,12 @@ do_create_app() {
             }
         " >/dev/null
 
-    log_info "Storing database connection string as a Podman Secret..."
-    podman secret rm "${APP_NAME}_mongo_uri" >/dev/null 2>&1 || true
-    printf "%s" "$SCOPED_MONGO_URI" | podman secret create "${APP_NAME}_mongo_uri" -
+    log_info "Storing database connection string as a secret file..."
+    sudo mkdir -p "$APP_DIR/secrets"
+    sudo chown -R "$(id -u):$(id -g)" "$APP_DIR/secrets"
+    chmod 700 "$APP_DIR/secrets"
+    printf "%s" "$SCOPED_MONGO_URI" > "$APP_DIR/secrets/MONGO_URI"
+    chmod 600 "$APP_DIR/secrets/MONGO_URI"
 
     # Create directory and assign permissions to current user
     sudo mkdir -p "$APP_DIR"
@@ -1628,13 +1624,12 @@ EOF
     chmod 600 "$APP_DIR/.env.production"
 
     # Generate docker-compose secrets sections dynamically
-    SERVICES_SECRETS_SECTION="    secrets:\n      - source: ${APP_NAME}_mongo_uri\n        target: MONGO_URI"
-    GLOBAL_SECRETS_SECTION="secrets:\n  ${APP_NAME}_mongo_uri:\n    external: true"
+    SERVICES_SECRETS_SECTION="    secrets:\n      - MONGO_URI"
+    GLOBAL_SECRETS_SECTION="secrets:\n  MONGO_URI:\n    file: ./secrets/MONGO_URI"
 
     for key in "${!MAPPED_SECRETS[@]}"; do
-        SECRET_NAME="${MAPPED_SECRETS[$key]}"
-        SERVICES_SECRETS_SECTION="${SERVICES_SECRETS_SECTION}\n      - source: ${SECRET_NAME}\n        target: ${key}"
-        GLOBAL_SECRETS_SECTION="${GLOBAL_SECRETS_SECTION}\n  ${SECRET_NAME}:\n    external: true"
+        SERVICES_SECRETS_SECTION="${SERVICES_SECRETS_SECTION}\n      - ${key}"
+        GLOBAL_SECRETS_SECTION="${GLOBAL_SECRETS_SECTION}\n  ${key}:\n    file: ./secrets/${key}"
     done
 
     # Write docker-compose.prod.yml
@@ -1882,29 +1877,37 @@ do_configure() {
 
     # Merge/Clear Secrets
     declare -A MAPPED_SECRETS
-    if [ "$CLEAR_SECRETS" = false ] && [ -f "$APP_DIR/docker-compose.prod.yml" ]; then
-        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9._-]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
-            KEY="${s_source#${APP_NAME}_secret_}"
-            MAPPED_SECRETS["$KEY"]="$s_source"
+    if [ "$CLEAR_SECRETS" = false ] && [ -d "$APP_DIR/secrets" ]; then
+        for s_file in "$APP_DIR/secrets"/*; do
+            [ -f "$s_file" ] || continue
+            KEY=$(basename "$s_file")
+            if [ "$KEY" != "MONGO_URI" ]; then
+                MAPPED_SECRETS["$KEY"]="true"
+            fi
         done
     fi
 
     if [ "$CLEAR_SECRETS" = true ]; then
-        log_info "Clearing existing registered secrets for application '$APP_NAME' from Podman..."
-        for s in $(podman secret ls --format "{{.Name}}" 2>/dev/null | grep "^${APP_NAME}_secret_"); do
-            podman secret rm "$s" >/dev/null 2>&1 || true
-        done
+        log_info "Clearing existing secrets for application '$APP_NAME'..."
+        if [ -d "$APP_DIR/secrets" ]; then
+            find "$APP_DIR/secrets" -mindepth 1 ! -name "MONGO_URI" -delete
+        fi
+    fi
+
+    if [ ${#APP_SECRETS[@]} -gt 0 ]; then
+        sudo mkdir -p "$APP_DIR/secrets"
+        sudo chown -R "$(id -u):$(id -g)" "$APP_DIR/secrets"
+        chmod 700 "$APP_DIR/secrets"
     fi
 
     for secret in "${APP_SECRETS[@]}"; do
         KEY="${secret%%=*}"
         VAL="${secret#*=}"
-        SECRET_NAME="${APP_NAME}_secret_${KEY}"
         
-        log_info "Registering secret '$KEY' in Podman..."
-        podman secret rm "$SECRET_NAME" >/dev/null 2>&1 || true
-        printf "%s" "$VAL" | podman secret create "$SECRET_NAME" -
-        MAPPED_SECRETS["$KEY"]="$SECRET_NAME"
+        log_info "Registering secret '$KEY'..."
+        printf "%s" "$VAL" > "$APP_DIR/secrets/$KEY"
+        chmod 600 "$APP_DIR/secrets/$KEY"
+        MAPPED_SECRETS["$KEY"]="true"
     done
 
     # Pre-Flight Contract Verification
@@ -1934,13 +1937,10 @@ do_configure() {
         if [ "$req" = "MONGO_URI" ]; then
             continue
         fi
-        SECRET_NAME="${MAPPED_SECRETS[$req]}"
-        if [ -z "$SECRET_NAME" ] && podman secret inspect "${APP_NAME}_secret_${req}" >/dev/null 2>&1; then
-            SECRET_NAME="${APP_NAME}_secret_${req}"
-            MAPPED_SECRETS["$req"]="$SECRET_NAME"
-        fi
-        if [ -z "$SECRET_NAME" ] || ! podman secret inspect "$SECRET_NAME" >/dev/null 2>&1; then
+        if [ ! -f "$APP_DIR/secrets/$req" ]; then
             MISSING_SECRETS+=("$req")
+        else
+            MAPPED_SECRETS["$req"]="true"
         fi
     done
 
@@ -1987,13 +1987,12 @@ EOF
     chmod 600 "$APP_DIR/.env.production"
 
     # Generate docker-compose secrets sections dynamically
-    SERVICES_SECRETS_SECTION="    secrets:\n      - source: ${APP_NAME}_mongo_uri\n        target: MONGO_URI"
-    GLOBAL_SECRETS_SECTION="secrets:\n  ${APP_NAME}_mongo_uri:\n    external: true"
+    SERVICES_SECRETS_SECTION="    secrets:\n      - MONGO_URI"
+    GLOBAL_SECRETS_SECTION="secrets:\n  MONGO_URI:\n    file: ./secrets/MONGO_URI"
 
     for key in "${!MAPPED_SECRETS[@]}"; do
-        SECRET_NAME="${MAPPED_SECRETS[$key]}"
-        SERVICES_SECRETS_SECTION="${SERVICES_SECRETS_SECTION}\n      - source: ${SECRET_NAME}\n        target: ${key}"
-        GLOBAL_SECRETS_SECTION="${GLOBAL_SECRETS_SECTION}\n  ${SECRET_NAME}:\n    external: true"
+        SERVICES_SECRETS_SECTION="${SERVICES_SECRETS_SECTION}\n      - ${key}"
+        GLOBAL_SECRETS_SECTION="${GLOBAL_SECRETS_SECTION}\n  ${key}:\n    file: ./secrets/${key}"
     done
 
     # Write docker-compose.prod.yml
@@ -2124,10 +2123,13 @@ do_update() {
     fi
     
     declare -A MAPPED_SECRETS
-    if [ -f "$APP_DIR/docker-compose.prod.yml" ]; then
-        for s_source in $(grep -o "${APP_NAME}_secret_[A-Za-z0-9._-]*" "$APP_DIR/docker-compose.prod.yml" 2>/dev/null | sort -u || true); do
-            KEY="${s_source#${APP_NAME}_secret_}"
-            MAPPED_SECRETS["$KEY"]="$s_source"
+    if [ -d "$APP_DIR/secrets" ]; then
+        for s_file in "$APP_DIR/secrets"/*; do
+            [ -f "$s_file" ] || continue
+            KEY=$(basename "$s_file")
+            if [ "$KEY" != "MONGO_URI" ]; then
+                MAPPED_SECRETS["$KEY"]="true"
+            fi
         done
     fi
     
@@ -2158,13 +2160,10 @@ do_update() {
         if [ "$req" = "MONGO_URI" ]; then
             continue
         fi
-        SECRET_NAME="${MAPPED_SECRETS[$req]}"
-        if [ -z "$SECRET_NAME" ] && podman secret inspect "${APP_NAME}_secret_${req}" >/dev/null 2>&1; then
-            SECRET_NAME="${APP_NAME}_secret_${req}"
-            MAPPED_SECRETS["$req"]="$SECRET_NAME"
-        fi
-        if [ -z "$SECRET_NAME" ] || ! podman secret inspect "$SECRET_NAME" >/dev/null 2>&1; then
+        if [ ! -f "$APP_DIR/secrets/$req" ]; then
             MISSING_SECRETS+=("$req")
+        else
+            MAPPED_SECRETS["$req"]="true"
         fi
     done
 
@@ -2188,13 +2187,12 @@ do_update() {
     log_success "Contract check passed."
 
     log_info "3. Re-generating compose file with image: $IMAGE..."
-    SERVICES_SECRETS_SECTION="    secrets:\n      - source: ${APP_NAME}_mongo_uri\n        target: MONGO_URI"
-    GLOBAL_SECRETS_SECTION="secrets:\n  ${APP_NAME}_mongo_uri:\n    external: true"
+    SERVICES_SECRETS_SECTION="    secrets:\n      - MONGO_URI"
+    GLOBAL_SECRETS_SECTION="secrets:\n  MONGO_URI:\n    file: ./secrets/MONGO_URI"
 
     for key in "${!MAPPED_SECRETS[@]}"; do
-        SECRET_NAME="${MAPPED_SECRETS[$key]}"
-        SERVICES_SECRETS_SECTION="${SERVICES_SECRETS_SECTION}\n      - source: ${SECRET_NAME}\n        target: ${key}"
-        GLOBAL_SECRETS_SECTION="${GLOBAL_SECRETS_SECTION}\n  ${SECRET_NAME}:\n    external: true"
+        SERVICES_SECRETS_SECTION="${SERVICES_SECRETS_SECTION}\n      - ${key}"
+        GLOBAL_SECRETS_SECTION="${GLOBAL_SECRETS_SECTION}\n  ${key}:\n    file: ./secrets/${key}"
     done
 
     COMPOSE_FILE="$APP_DIR/docker-compose.prod.yml"
@@ -2289,15 +2287,12 @@ do_destroy_app() {
         if [ "$is_global_uninstall" = "true" ]; then
             log_info "2. Bypassing individual secret deletion (handled globally during uninstall)."
         else
-            log_info "2. Deleting registered secrets from Podman..."
-            podman secret rm "${APP_NAME}_mongo_uri" >/dev/null 2>&1 || true
-            for s in $(podman secret ls --format "{{.Name}}" 2>/dev/null | grep "^${APP_NAME}_secret_"); do
-                podman secret rm "$s" >/dev/null 2>&1 || true
-            done
+            log_info "2. Deleting secret files..."
+            sudo rm -rf "$APP_DIR/secrets"
             log_success "Secrets deleted."
         fi
     else
-        log_info "2. Preserving registered secrets in Podman."
+        log_info "2. Preserving secret files."
     fi
 
     # 3. Handle Data cleanup (database drop and user drop)
@@ -2365,10 +2360,23 @@ do_destroy_app() {
 
     # 5. Handle Parameters / Workspace cleanup
     if [ "$local_destroy_params" = "delete" ]; then
+        local -a preserve_opts=()
         if [ "$local_destroy_backups" = "keep" ] && [ -d "$APP_DIR/backups" ]; then
-            log_info "5. Deleting application configurations inside '$APP_DIR' while preserving backups..."
-            sudo find "$APP_DIR" -mindepth 1 -maxdepth 1 ! -name "backups" -exec rm -rf {} +
-            log_success "Application configurations deleted, backups preserved."
+            preserve_opts+=("backups")
+        fi
+        if [ "$local_destroy_secrets" = "keep" ] && [ -d "$APP_DIR/secrets" ]; then
+            preserve_opts+=("secrets")
+        fi
+
+        if [ ${#preserve_opts[@]} -gt 0 ]; then
+            log_info "5. Deleting application configurations inside '$APP_DIR' while preserving selected folders (${preserve_opts[*]})..."
+            local find_cmd="sudo find \"$APP_DIR\" -mindepth 1 -maxdepth 1"
+            for folder in "${preserve_opts[@]}"; do
+                find_cmd="${find_cmd} ! -name \"${folder}\""
+            done
+            find_cmd="${find_cmd} -exec rm -rf {} +"
+            eval "$find_cmd"
+            log_success "Application configurations deleted, preserved: ${preserve_opts[*]}."
         else
             log_info "5. Deleting application directory '$APP_DIR' completely..."
             sudo rm -rf "$APP_DIR"
