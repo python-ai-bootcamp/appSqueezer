@@ -14,10 +14,22 @@ Follow these sequential steps to adapt the target project:
    * **Python**: Presence of `requirements.txt`, `pyproject.toml`, or `setup.py`. Locate the main script or API routing entrypoint (usually `main.py` or `app.py`).
 2. Identify all required environment parameters and sensitive keys (e.g. database connections, API tokens) used throughout the code.
 
+> [!IMPORTANT]
+> **App Name Normalization Rules**: The orchestrator (`appSqueezer.sh`) derives the application name (`APP_NAME`) from the last segment of the container image URL, lowercases it, and replaces dots (`.`) with hyphens (`-`). For example, `ghcr.io/user/My.Awesome.App:v1` becomes `my-awesome-app`. This normalized name is used for the host directory (`/opt/my-awesome-app`), Traefik routing prefix (`/my-awesome-app`), and database schema namespace (`my_awesome_app_db`).
+>
+> **Key Restrictions & Reserved Configuration Names**:
+> - Custom parameter and secret keys can only contain alphanumeric characters, hyphens (`-`), dots (`.`), and underscores (`_`).
+> - Do not declare the following **reserved** parameter or secret names, as they are managed and validated by the gateway and cannot be overridden:
+>   `PORT`, `APP_ENV`, `APP_DOMAIN`, `APP_CPUS`, `APP_MEM_LIMIT`, `MONGO_URI`, `MONGO_ROOT_USER`, `MONGO_ROOT_PASSWORD`.
+> - The orchestrator will automatically provision and inject `PORT=3000`, `APP_ENV=production`, `APP_DOMAIN=<domain>`, and `/run/secrets/MONGO_URI` (if MongoDB is used) to your container. You do NOT need to ask the user to supply them.
+
 ---
 
 ### Step 2: Implement the `--show-spec` Contract
 At the absolute beginning of the application's startup file (before database or server initialization), intercept the CLI argument `--show-spec`. If present, print the list of required parameters and secrets, and exit immediately with code `0`.
+
+> [!IMPORTANT]
+> Both the `REQUIRED_PARAMETERS=` and `REQUIRED_SECRETS=` lines **must** be printed to stdout. If the application does not have any parameters or secrets, it must still print the corresponding key with an empty value (e.g., `REQUIRED_SECRETS=`). Omitting either line will cause the orchestration script (`appSqueezer.sh`) contract validation check to fail.
 
 > [!WARNING]
 > For Python applications, ensure you do not run the server using the `uvicorn` command-line utility in your container entrypoint, as Uvicorn's CLI will intercept `--show-spec` and fail with argument errors. Instead, launch Uvicorn programmatically in code (see Step 4) and run the script using `python`.
@@ -234,24 +246,24 @@ Generate a local `docker-compose.dev.yml` file to test the application locally w
 
    secrets:
      dev_mongo_uri:
-       file: ../dev_secrets/dev_mongo_uri.txt
+       file: .dev_secrets/mongo_uri.txt
      dev_admin_password:
-       file: ../dev_secrets/dev_admin_password.txt
+       file: .dev_secrets/admin_password.txt
    ```
 
 > [!IMPORTANT]
 > The parameters and secrets shown above (`multiplication_factor`, `ADMIN_PASSWORD`, etc.) are **examples only**. Replace them with the actual parameters and secrets required by the target project, as declared in its `--show-spec` contract output.
 
 > [!IMPORTANT]
-> **Keep local secrets safe**: Do not store plain text password files inside your Git repository. It is a best practice to place them in a dedicated directory outside the repository root (e.g. `../dev_secrets/`). If you must place them inside the repository during testing, ensure they are explicitly added to your `.gitignore` file.
+> **Enforce Git Isolation**: You **must** automatically check the target project's `.gitignore` file and append `.dev_secrets/` to it. This prevents developers from accidentally committing local plain text secret files to the git repository.
 
 > [!NOTE]
-> **Initialize Local Secret Files**: Write the default contents for the dev secret files in a folder outside the project directory to allow immediate local execution via `docker compose -f docker-compose.dev.yml up`:
-> 1. `../dev_secrets/dev_mongo_uri.txt`:
+> **Initialize Local Secret Files**: Write the default contents for the dev secret files in a `.dev_secrets/` folder in the project root directory to allow immediate local execution via `docker compose -f docker-compose.dev.yml up`:
+> 1. `.dev_secrets/mongo_uri.txt`:
 >    ```text
 >    mongodb://mongo-db:27017/my_dev_db
 >    ```
-> 2. `../dev_secrets/dev_admin_password.txt`:
+> 2. `.dev_secrets/admin_password.txt`:
 >    ```text
 >    my_secure_dev_password
 >    ```
@@ -294,3 +306,15 @@ echo -e "Copy and run this command on your production VM:"
 echo -e "  ./appSqueezer.sh create-app ghcr.io/$GHCR_USER/$APP_NAME:latest"
 ```
 Make the script executable: `chmod +x scripts/deploy-ghcr.sh`.
+
+---
+
+### Step 9: Document Local Secrets and Setup Instructions
+To ensure developers do not need to search through global orchestration documentation to configure and test their application locally:
+1. **Console Output**: At the end of execution, print a clear console message to the user summarizing the required configurations.
+2. **Target README**: Create or update the target application's `README.md` (or append a new section titled `## Local Development & Environment Parity`). 
+
+The output and documentation **must** explicitly list:
+* **Parameters**: Every required parameter (e.g., `multiplication_factor`) and where to define it (e.g., inside `docker-compose.dev.yml` as environment variables).
+* **Secrets**: Every custom required secret (e.g., `ADMIN_PASSWORD`) plus the local-only `MONGO_URI` connection string, the exact filename/path where they must write the value on their host (e.g., `.dev_secrets/mongo_uri.txt`, `.dev_secrets/admin_password.txt`), and the fact that the `.dev_secrets/` folder is git-ignored to prevent credential leaks. Explain that in production, `MONGO_URI` is automatically provisioned and injected by the orchestrator.
+* **Commands**: The exact command to start local dev mode (e.g., `docker compose -f docker-compose.dev.yml up --build`).
