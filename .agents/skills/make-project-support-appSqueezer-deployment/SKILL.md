@@ -1,3 +1,9 @@
+---
+name: make-project-support-appsqueezer-deployment
+description: Automatically refactor and prepare any web application repository to support dynamic deployment on a production VM using the rootless appSqueezer.sh orchestrator.
+version: 1.0.0
+---
+
 # Agentic Skill - Make Project Support appSqueezer Deployment
 
 This skill teaches you how to automatically refactor and prepare any web application repository to support dynamic deployment on a production VM using the rootless `appSqueezer.sh` orchestrator.
@@ -96,7 +102,7 @@ def get_secret_or_env(secret_name: str, env_fallback_name: str) -> str:
         pass
     return os.getenv(env_fallback_name) or os.getenv(secret_name) or ''
 
-# Example usage:
+// Example usage:
 mongo_uri = get_secret_or_env('MONGO_URI', 'MONGO_URI')
 # Note: ADMIN_PASSWORD is an example of an app-specific optional secret.
 admin_password = get_secret_or_env('ADMIN_PASSWORD', 'ADMIN_PASSWORD')

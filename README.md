@@ -12,16 +12,17 @@ This repository provides an automated wrapper package to configure a production-
 ├── README.md                           # Main project overview
 ├── appSqueezer.sh                      # Automation wrapper utility (Setup / Teardown / App Creation)
 ├── docs/
-│   ├── deploymentSpec.md               # Detailed system design, security features & architecture
-│   ├── app_squeezer_guide__github_ghcr_app_deployment_guide.md # Workstation -> GHCR -> VM lifecycle
-│   └── app_squeezer_guide__developing_app_squeezer_compatible_application.md # Developer guide (port/secrets)
+│   └── deploymentSpec.md               # Detailed system design, security features & architecture
 ├── sampleApps/
 │   ├── sampleNodeApp/                  # Reference Node.js application using Express & Mongo Secret
 │   └── samplePythonApp/                # Reference Python application using FastAPI & Mongo Secret
 └── .agents/
     └── skills/
         └── make-project-support-appSqueezer-deployment/
-            └── instructions.md         # Agentic skill instructions for AppSqueezer compatibility
+            ├── SKILL.md                # Agentic skill instructions for AppSqueezer compatibility
+            └── references/
+                ├── app_squeezer_guide__developing_app_squeezer_compatible_application.md # Developer guide (port/secrets)
+                └── app_squeezer_guide__github_ghcr_app_deployment_guide.md # Workstation -> GHCR -> VM lifecycle
 ```
 
 ---
@@ -131,6 +132,6 @@ To stop and remove all routing infrastructure, networks, and services:
 ## 📖 In-Depth Guides
 
 * See [deploymentSpec.md](docs/deploymentSpec.md) for full architectural diagrams, prerequisite specifications, security controls, and auto-restart policies.
-* See [app_squeezer_guide__github_ghcr_app_deployment_guide.md](docs/app_squeezer_guide__github_ghcr_app_deployment_guide.md) for the complete developer packaging guide (Personal Access Tokens, tagging, pushing to GitHub Container Registry, and production pulls).
-* See [app_squeezer_guide__developing_app_squeezer_compatible_application.md](docs/app_squeezer_guide__developing_app_squeezer_compatible_application.md) for standards on structuring applications to naturally support dynamic port binding and container secret file reads.
+* See [app_squeezer_guide__github_ghcr_app_deployment_guide.md](.agents/skills/make-project-support-appSqueezer-deployment/references/app_squeezer_guide__github_ghcr_app_deployment_guide.md) for the complete developer packaging guide (Personal Access Tokens, tagging, pushing to GitHub Container Registry, and production pulls).
+* See [app_squeezer_guide__developing_app_squeezer_compatible_application.md](.agents/skills/make-project-support-appSqueezer-deployment/references/app_squeezer_guide__developing_app_squeezer_compatible_application.md) for standards on structuring applications to naturally support dynamic port binding and container secret file reads.
 
